@@ -9,9 +9,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 
-import numpy as np
+if TYPE_CHECKING:  # annotations only: the import worker must not load numpy
+    import numpy as np
 
 # (stage message, fraction done in [0, 1]); called from worker threads.
 ProgressFn = Callable[[str, float], None]

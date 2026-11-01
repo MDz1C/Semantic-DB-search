@@ -75,6 +75,15 @@ use them, do not re-implement folding/tokenizing). Public signatures in the modu
   Columns that are empty in the header *and* all data rows are dropped. Fully empty rows are skipped.
   Rows are padded/truncated to the header width. `source_rows` records the 1-based sheet row number.
 * Progress reported as `("Reading rows…", fraction)`; honour `cancel` every ~2,000 rows.
+* **Isolation** (`core/isolation.py`): the public `list_sheets`/`read_raw`/`read_table` never parse an
+  imported file in the app's own process. They start a short-lived copy of the app
+  (`--import-worker`) that first caps its own committed memory (Windows Job Object; 40 % of RAM,
+  between 1 and 3 GiB), parses the file, and returns JSON (never pickle) through a temporary folder;
+  progress travels through a small file and Cancel kills the worker. A crafted 5 KB `.xlsx` that
+  makes the reader request 512 GB (two cells at A1 and XFD1048576) — which would abort the whole app
+  in-process — now ends with a friendly "needs more memory than is safe" message. Legacy `.xls`
+  containers are additionally pre-validated (OLE directory and BIFF dimensions) before parsing.
+  `SEMDB_IMPORT_IN_PROCESS=1` parses in-process (set inside the worker and by the test suite).
 
 ## 5. Column roles (`core/profile.py`)
 
@@ -89,8 +98,11 @@ a one-sentence reason:
      sponsor, company, compania, empresa, brand, marca, isin, ticker, symbol, simbolo, cusip, sedol, wkn`;
    * `is_identifier` (reason: "Unique code per row — exact matches identify a row");
    * **contamination**: a low-cardinality text column (unique ratio ≤ 0.2, ≥ 2 distinct values) whose
-     values' distinctive tokens appear inside another text column of the same row in ≥ 30 % of rows
-     (reason: "Its values also appear inside 'Fund name' in 64 % of rows").
+     values' distinctive tokens **lead** another text column of the same row (are among its first two
+     words longer than one character) in ≥ 30 % of rows (reason: "Its values also appear inside
+     'Fund name' in 64 % of rows"). Brands prefix the names they repeat in ("iShares Core…"); a region
+     inside "MSCI Japan" or a currency at the end of a name is an attribute, so Region/Currency/
+     Distribution columns stay Search columns instead of becoming identities.
 2. **Display only** when numeric ratio ≥ 0.8, date ratio ≥ 0.8, average length > 160 (long prose),
    unique count ≤ 1, or the column is ≥ 95 % empty.
 3. **Search** otherwise (text that describes the item; reason: "Descriptive text").
@@ -162,12 +174,22 @@ Columns without evidence contribute 1.
 Numpy-only inverted index. Features per document (computed on `normalize`d text):
 * character 3-grams of each token padded with spaces (`" s&p "` → `" s&"`, `"s&p"`, `"&p "`); tokens of
   length ≤ 1 contribute the padded token itself;
-* word features `w:` + token and `w:` + each part of `split_alnum(token)`, with a ×1.5 weight multiplier.
+* word features `w:` + token and `w:` + each part of `split_alnum(token)`, with a ×1.5 weight multiplier;
+* concept features `c:` + concept (×1.5) for a short table of unambiguous fund-name shorthand in
+  English and Spanish (`Acc/Accumulating/Acumulación`, `Dist/Distributing`, `Hdg/Hedged/Cubierto`,
+  `Govt`, `Corp`, `Intl`, `Infl`, `Tsy/Treasury/Tesoro`, `EM`, `Mkt`, `Div`, `Bd/Bonos`, `Eq`, `Yr`):
+  spellings that share almost no letters still meet. On the tuning universe this raised lexical
+  Acc@1 0.952 → 0.963 and reworded share classes 0.77 → 0.88.
 TF = `1 + log(tf)`; IDF = `log((1 + N) / (1 + df)) + 1`; documents L2-normalized. Query vectors use the
 same weighting; features unseen in the corpus still count in the query norm with the maximum IDF.
 Scores via postings (CSR arrays `indptr`, `doc_ids` int32, `weights` float32) gathered for the query's
 features and summed with `np.bincount(..., minlength=N)`. Must build 45k docs in ≤ 5 s and score a
 query in ≤ 15 ms. Empty query → zeros.
+
+`match(query, beta)` measures how completely a document covers the *query* (what ranking uses):
+features count once, weighted by `(idf · boost)²`; with `I` the mass shared by query and document,
+`recall = I / M_query` and `F_β = (1 + β²) I / (β² M_query + M_doc)`. A query fully contained in a
+longer name scores high instead of being diluted by the name's extra words.
 
 ## 8. Embeddings (`core/embedder.py`, `tools/fetch_model.py`)
 
@@ -176,16 +198,21 @@ query in ≤ 15 ms. Empty query → zeros.
 * `tools/fetch_model.py` downloads the fp32 `onnx/model.onnx` and `tokenizer.json` (plus config files)
   at the pinned revision, **verifies SHA-256**, quantizes with
   `onnxruntime.quantization.quantize_dynamic(weight_type=QInt8, per_channel=True, reduce_range=True)`
-  (7-bit weights: no u8s8 saturation on AVX2-only CPUs; measured fastest here: ~880 sentences/s,
-  cosine fidelity 0.99 vs fp32), checks fidelity on probe sentences, and writes
+  (7-bit weights: no u8s8 saturation on AVX2-only CPUs; ~1,230–1,440 sentences/s on a 12-core
+  laptop, fidelity vs fp32 mean 0.994 / min 0.984 on 40 probes; deterministic output), checks
+  fidelity on probe sentences, and writes
   `models/paraphrase-multilingual-MiniLM-L12-v2/{model.onnx, tokenizer.json, manifest.json}`.
   Pinned SHA-256: `onnx/model.onnx` `10f7a088420252b26caf819236ca2c9d2987afd0fc06fec7553b542a5655a05a`,
   `tokenizer.json` `2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8`.
-* Runtime: `tokenizers.Tokenizer.from_file`, truncation 128, padding per batch; inputs `input_ids`,
-  `attention_mask`, `token_type_ids` (zeros) as int64; mean pooling over the attention mask; L2 norm.
-  Sort texts by length before batching (64) and restore order. ONNX session: `ORT_ENABLE_ALL`,
-  CPU provider, default threads. `model_id` = `"<model name>@<revision[:7]>/q8rr"`. Empty strings embed
-  fine (they produce a valid vector). Cancel checked between batches.
+* Runtime: `tokenizers.Tokenizer.from_file`, truncation `max_seq_length` (manifest, default 128;
+  texts cut to 32 chars/token first), **no padding: each text is one model run** (`input_ids`,
+  `attention_mask` ones, `token_type_ids` zeros, int64), mean pooling, L2 norm. Runs are
+  single-threaded (`intra_op_num_threads=1`, `ORT_ENABLE_ALL`, CPU provider) on a pool of one worker
+  per logical CPU (max 32), order preserved. Reason: activations are quantized per tensor, so in a
+  padded batch a text's vector depended on its batch neighbours (cosine as low as 0.977 between two
+  batchings of the same text); one run per text is batch-independent and faster from 4 CPUs up.
+  `model_id` = `"<model>@<revision[:7]>/<quantization tag>"` from manifest.json (defaults: pinned
+  revision, `q8rr`). Cancel polled before every text; `onnxruntime` is imported lazily.
 * `load_default_embedder()` returns None (and logs why) when the model folder is missing/corrupt; the
   app then runs lexical-only and says so in the status bar.
 
@@ -196,10 +223,13 @@ query in ≤ 15 ms. Empty query → zeros.
    column, use every non-IGNORE column as search text **without** cleaning. `primary_column` = first
    search column (else first column).
 2. `FamilyModel.build` (skipped when `config.use_family` is False).
-3. Row text = cleaned search cells joined with `" · "` (empty cells skipped).
-4. `LexicalIndex(row_texts)`.
-5. Embeddings: deduplicate row texts, look them up in the cache, embed the missing ones (progress
-   `"Understanding rows…"`), write them back, then build an `(N, dim)` float32 matrix.
+3. Per search column, every row's cell cleaned of the row's own identity; the row text (for
+   whole-row recall and display) is those cells joined with `" · "` (empty cells skipped).
+4. A `LexicalIndex` per search column over its distinct cleaned values (categorical columns cost
+   almost nothing), plus one over the row texts.
+5. Embeddings of every distinct cleaned cell, **case-folded** (the model is case-sensitive and
+   spreadsheets mix "ISHARES CORE…" with "iShares Core…"): looked up in the cache, the missing ones
+   embedded (progress `"Understanding rows…"`) and written back.
 6. Exact-id lookup: for every DECIDING or SEARCH column where `text.is_identifier_column` holds, map
    normalized value (and space-less form) → row indices.
 Progress stages: `"Analyzing columns…"`, `"Learning identity aliases…"`, `"Indexing words…"`,
@@ -209,10 +239,15 @@ Progress stages: `"Analyzing columns…"`, `"Learning identity aliases…"`, `"I
 1. `detection = family.detect(query)`; `cleaned = remove_spans(query, detection.spans)`.
    If `cleaned` has no tokens, the query only named an identity: `text_score = 0.5` for every row
    (ranking then comes from identity, ties broken by lexical score of the raw query).
-2. `lexical = lex.scores(cleaned)`.
-3. `semantic = clip((E @ embed(cleaned) − floor) / (1 − floor), 0, 1)` with `floor = config.semantic_floor`.
-4. `text_score = w * semantic + (1 − w) * lexical` (`w = config.semantic_weight`; lexical only when
-   no embedder).
+2. `lexical = 0.65 · max over search columns of F_3(cleaned, column) + 0.35 · recall(cleaned, row)`
+   (the best-matching column decides; covering the query across several columns still helps).
+3. `semantic = clip((max over columns of cos(embed(lower(cleaned)), column) − floor) / (1 − floor), 0, 1)`
+   with `floor = config.semantic_floor` (0.30).
+4. `text_score = w * semantic + (1 − w) * lexical` with `w = config.semantic_weight` = **0.2**
+   (lexical only when no embedder). Tuned on a held-out synthetic universe (seed 11, 10k rows,
+   600 queries): Acc@1 0.952 lexical-only, **0.960 at w = 0.15**, 0.952 at 0.25, 0.928 at the original
+   0.5; embeddings lift Spanish paraphrases 0.81 → 0.98 while costing a little on typos, which the
+   lexical channel covers. 0.2 leans slightly semantic for real-world paraphrases.
 5. Exact identifier hit (any query token or the whole query, normalized/space-less, found in the id
    lookup) → that row's `text_score = 1` and `exact_id = column`.
 6. `factor = family.family_factor(detection, config.strictness)`; `score = text_score * factor`.
@@ -296,7 +331,9 @@ then every column of the entry. Bold header, frozen header row, autofilter, sens
   off): top-level rows are queries (first column spanned, 44 px): chevron, query text (semibold),
   detected-identity pills (e.g. `BlackRock`), muted "5 results · 2 min ago", best score pill on the
   right. Children are the first K results (34 px): rank, score pill (green ≥ 85 %, amber ≥ 60 %, grey
-  below; thin bar), then the dataset columns ordered primary → other search → deciding → rest.
+  below; thin bar), then the dataset columns ordered primary → deciding → other search → rest (the
+  identity the match hinges on stays visible next to the title; the title column keeps its content
+  width and the others scroll).
   Deciding cells render as soft pills with ✓ (agrees) / ✕ (conflicts) when the query named that
   column. Everything starts **collapsed** (R9); a single-query search auto-expands its new list.
   **Collapse all / Expand all** toggle button (Ctrl+Shift+C). Sort segmented control
@@ -349,7 +386,8 @@ block the UI thread for more than ~50 ms.
 * No sockets: no web server, no `QtNetwork`, no HTTP clients in the bundle (PyInstaller excludes
   `huggingface_hub`, `httpx*`, `requests`, `urllib3`, Qt network/QML/WebEngine modules and the `tls`
   and `networkinformation` Qt plugins). `HF_HUB_OFFLINE=1` set defensively at startup.
-* Files are parsed by memory-safe calamine; no macros or formulas are executed.
+* Files are parsed by memory-safe calamine in an isolated, memory-capped worker process (§4); no
+  macros or formulas are executed, and a malicious file can neither crash the app nor exhaust RAM.
 * Exports never turn cell text into formulas (formula injection).
 * All state is per-user in `%LOCALAPPDATA%\SemanticDBSearch`; the installer offers to delete it on
   uninstall. SQL is always parameterised. No pickle anywhere.
@@ -367,7 +405,10 @@ compression. Output: `dist/SemanticDBSearch-Setup-<version>.exe`.
 
 * `pytest` green; core modules have focused unit tests; one offscreen UI smoke test.
 * `tools/evaluate.py` on the synthetic 45k-row fund universe reports Acc@1 / MRR@10 / brand
-  precision for the full hybrid vs ablations; the hybrid must win, and brand precision@5 for queries
-  that name a brand must be ≥ 0.95.
+  precision for the full hybrid vs ablations; brand precision@5 for queries that name a brand must
+  be ≥ 0.95. Measured (held-out seed 7, 600 queries): full 0.933 / Acc@5 0.982 / MRR 0.957 / brand
+  0.997; without the family model 0.912 / 0.963 / 0.936 / 0.971; lexical only 0.940 / 0.980 /
+  0.958 / 0.996. The family model is the decisive component; embeddings and the word index are
+  complementary (paraphrases vs typos) and tie overall on this lexical-heavy synthetic benchmark.
 * Performance on a mid-range laptop: import 45k rows < 10 s; first index ≈ 1 min (cached afterwards:
   < 10 s); search < 50 ms per query.

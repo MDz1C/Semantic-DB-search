@@ -19,6 +19,8 @@ from semdb.core.types import Role, Table  # noqa: E402
 def isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     data = tmp_path / "appdata"
     monkeypatch.setenv("SEMDB_DATA_DIR", str(data))
+    # Parse imported files in-process for speed; tests/test_isolation.py covers the worker.
+    monkeypatch.setenv("SEMDB_IMPORT_IN_PROCESS", "1")
     return data
 
 
