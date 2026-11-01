@@ -1,5 +1,6 @@
-# Virtual Environment
+# Virtual environments
 .venv/
+.venv-*/
 venv/
 env/
 ENV/
@@ -34,23 +35,20 @@ Desktop.ini
 *.log
 logs/
 
-# Build output
+# Build output (PyInstaller / Inno Setup)
 build/
 dist/
 *.exe
 *.spec
+!packaging/*.spec
 
-# Project-specific - User Data 
+# Embedding model: downloaded and verified by tools/fetch_model.py, never committed
+models/
+
+# Leftovers from the old Streamlit prototype (user data now lives in %LOCALAPPDATA%)
 saved_state/
 cache/
 data/
-models/sentence_transformer_model/
-*.faiss
-*.bin
-
-# Streamlit
-.streamlit/
-.streamlit/secrets.toml
 
 # Others
 Project_scope.txt

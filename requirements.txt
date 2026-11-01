@@ -1,0 +1,8 @@
+# Runtime dependencies (pinned for reproducible builds). Everything runs offline.
+PySide6-Essentials==6.12.0
+numpy==2.5.4
+onnxruntime==1.31.1
+tokenizers==0.23.3
+rapidfuzz==3.14.6
+python-calamine==0.9.0
+xlsxwriter==3.3.1

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-db-search"
+version = "1.0.0"
+description = "Offline desktop app for intelligent, identity-aware search over Excel databases."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Manuel Dzimah" }]
+dependencies = [
+  "PySide6-Essentials>=6.8",
+  "numpy>=2.0",
+  "onnxruntime>=1.20",
+  "tokenizers>=0.20",
+  "rapidfuzz>=3.0",
+  "python-calamine>=0.3",
+  "xlsxwriter>=3.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyinstaller>=6.10", "onnx>=1.17", "pillow>=10"]
+
+[project.gui-scripts]
+semantic-db-search = "semdb.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

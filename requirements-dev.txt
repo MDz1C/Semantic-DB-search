@@ -1,0 +1,6 @@
+# Build, test and model-preparation tools (not shipped inside the app).
+-r requirements.txt
+pytest==9.2.0
+pyinstaller==6.22.3
+onnx==1.23.2
+pillow==13.0.0
