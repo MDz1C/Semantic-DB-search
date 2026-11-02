@@ -15,6 +15,7 @@ from pathlib import Path
 from . import APP_ID
 
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+LEGACY_APP_ID = "SemanticDBSearch"  # data folder of builds released before the Fundscope name
 
 
 def is_frozen() -> bool:
@@ -44,7 +45,7 @@ def sample_workbook() -> Path:
 
 
 def data_dir() -> Path:
-    """Per-user writable folder (``%LOCALAPPDATA%\\SemanticDBSearch`` on Windows).
+    """Per-user writable folder (``%LOCALAPPDATA%\\Fundscope`` on Windows).
 
     ``SEMDB_DATA_DIR`` overrides it, which tests use to stay isolated.
     """
@@ -54,6 +55,12 @@ def data_dir() -> Path:
     elif sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
         path = Path(base) / APP_ID
+        legacy = Path(base) / LEGACY_APP_ID
+        if not path.exists() and legacy.is_dir():  # the app was called "Semantic DB Search"
+            try:
+                legacy.rename(path)
+            except OSError:
+                pass
     elif sys.platform == "darwin":
         path = Path.home() / "Library" / "Application Support" / APP_ID
     else:

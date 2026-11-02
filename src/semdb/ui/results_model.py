@@ -8,11 +8,11 @@ primary → other search → deciding → display only (ARCHITECTURE.md §12.2).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, KeysView, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, QPersistentModelIndex, Qt
+from PySide6.QtCore import QAbstractItemModel, QModelIndex, QPersistentModelIndex, Qt, Signal
 
 from ..core.text import fold, normalize
 from ..core.types import HistoryEntry, ResultRow, Role
@@ -31,6 +31,12 @@ SORT_ALPHA = "alpha"
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _PER_ROW_SIGNAL_LIMIT = 2000  # above this, K changes reset the model instead of per-row signals
+_QUERY_FLAGS = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+# Results never have children: the tree neither expands them (expandAll) nor asks for their rows.
+_RESULT_FLAGS = _QUERY_FLAGS | Qt.ItemFlag.ItemNeverHasChildren
+# Sorting and filtering move whole rows; the columns (and so the header) stay as they are.
+_ROWS_MOVED = QAbstractItemModel.LayoutChangeHint.VerticalSortHint
+_WITH_HINT = "QList<QPersistentModelIndex>,QAbstractItemModel::LayoutChangeHint"  # signal overload
 
 AnyIndex = QModelIndex | QPersistentModelIndex
 
@@ -204,11 +210,14 @@ def results_tsv(items: list[tuple[HistoryEntry, ResultRow]], columns: list[Colum
 class ResultsModel(QAbstractItemModel):
     """Two-level model.  Top-level internal id is 0; a result's internal id is its parent row + 1."""
 
+    times_changed = Signal()  # now() moved on: the relative times painted are stale
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._entries: list[HistoryEntry] = []
         self._visible: list[HistoryEntry] = []
         self._counts: list[int] = []
+        self._rows: dict[str, int] = {}  # key -> row of each visible list
         self._meta: dict[int, _Meta] = {}
         self._columns: list[ColumnInfo] = []
         self._k = 5
@@ -264,21 +273,16 @@ class ResultsModel(QAbstractItemModel):
         mode = mode if mode in (SORT_RECENT, SORT_ALPHA) else SORT_RECENT
         if mode == self._sort:
             return
-        self.beginResetModel()
         self._sort = mode
-        self._rebuild_visible()
-        self.endResetModel()
+        self._move_rows()
 
     def set_filter(self, text: str) -> None:
         terms = fold(text).split()
-        if terms == self._filter_terms:
-            self._filter_text = text
-            return
-        self.beginResetModel()
         self._filter_text = text
+        if terms == self._filter_terms:
+            return
         self._filter_terms = terms
-        self._rebuild_visible()
-        self.endResetModel()
+        self._move_rows()
 
     def set_k(self, k: int) -> None:
         k = max(1, int(k))
@@ -306,14 +310,12 @@ class ResultsModel(QAbstractItemModel):
                 self.endRemoveRows()
 
     def refresh_times(self) -> None:
-        """Re-evaluate relative times ("2 min ago") of every query row."""
+        """Re-evaluate relative times ("2 min ago") of every query row.
+
+        Only painting shows them, no item data changes: views repaint on ``times_changed``
+        (dataChanged would make the tree measure every row of every list again)."""
         self._now = datetime.now(timezone.utc)
-        if self._visible:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(len(self._visible) - 1, 0),
-                [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole],
-            )
+        self.times_changed.emit()
 
     def is_query(self, index: AnyIndex) -> bool:
         return index.isValid() and index.internalId() == 0
@@ -333,11 +335,18 @@ class ResultsModel(QAbstractItemModel):
             return None
         return entry.results[index.row()]
 
+    def is_last_result(self, index: AnyIndex) -> bool:
+        """Whether ``index`` is the last result its list shows (constant time: layouts ask per row)."""
+        list_row = index.internalId() - 1
+        return 0 <= list_row < len(self._counts) and index.row() == self._counts[list_row] - 1
+
     def query_index(self, key: str) -> QModelIndex:
-        for row, entry in enumerate(self._visible):
-            if self._meta[id(entry)].key == key:
-                return self.index(row, 0)
-        return QModelIndex()
+        row = self._rows.get(key)
+        return QModelIndex() if row is None else self.createIndex(row, 0, 0)
+
+    def visible_keys(self) -> KeysView[str]:
+        """Keys of the lists shown (a live set-like view)."""
+        return self._rows.keys()
 
     def key_of(self, entry: HistoryEntry) -> str:
         meta = self._meta.get(id(entry))
@@ -351,26 +360,29 @@ class ResultsModel(QAbstractItemModel):
         return result.cells[source] if 0 <= source < len(result.cells) else ""
 
     # ----------------------------------------------------------------- Qt model
+    # The tree calls index/parent/rowCount/flags for every row it lays out: plain bookkeeping,
+    # no calls back into Qt (hasIndex would call rowCount and columnCount again).
     def index(self, row: int, column: int, parent: AnyIndex = QModelIndex()) -> QModelIndex:
-        if not self.hasIndex(row, column, parent):
+        if not 0 <= column <= len(self._columns):
             return QModelIndex()
         if not parent.isValid():
-            return self.createIndex(row, column, 0)
-        if parent.internalId() == 0:
-            return self.createIndex(row, column, parent.row() + 1)
-        return QModelIndex()
+            return self.createIndex(row, column, 0) if 0 <= row < len(self._visible) else QModelIndex()
+        counts, list_row = self._counts, parent.row()
+        if parent.internalId() or parent.column() or list_row >= len(counts) or not 0 <= row < counts[list_row]:
+            return QModelIndex()
+        return self.createIndex(row, column, list_row + 1)
 
     def parent(self, index: AnyIndex = QModelIndex()) -> QModelIndex:  # type: ignore[override]
-        if not index.isValid() or index.internalId() == 0:
-            return QModelIndex()
-        return self.createIndex(index.internalId() - 1, 0, 0)
+        list_id = index.internalId()  # 0 for query rows and invalid indexes
+        return self.createIndex(list_id - 1, 0, 0) if list_id else QModelIndex()
 
     def rowCount(self, parent: AnyIndex = QModelIndex()) -> int:  # noqa: N802
         if not parent.isValid():
             return len(self._visible)
-        if parent.internalId() == 0 and parent.column() == 0 and parent.row() < len(self._counts):
-            return self._counts[parent.row()]
-        return 0
+        list_row = parent.row()
+        if parent.internalId() or parent.column() or list_row >= len(self._counts):
+            return 0
+        return self._counts[list_row]
 
     def columnCount(self, parent: AnyIndex = QModelIndex()) -> int:  # noqa: N802
         return 1 + len(self._columns)
@@ -378,7 +390,7 @@ class ResultsModel(QAbstractItemModel):
     def flags(self, index: AnyIndex) -> Qt.ItemFlag:
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
-        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        return _RESULT_FLAGS if index.internalId() else _QUERY_FLAGS
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: N802
         if orientation != Qt.Orientation.Horizontal:
@@ -472,3 +484,30 @@ class ResultsModel(QAbstractItemModel):
             entries = sorted(entries, key=lambda e: (-self._meta[id(e)].timestamp, self._meta[id(e)].position))
         self._visible = entries
         self._counts = [min(self._k, len(e.results)) for e in entries]
+        self._rows = {}
+        for row, entry in enumerate(entries):
+            self._rows.setdefault(self._meta[id(entry)].key, row)
+
+    def _move_rows(self) -> None:
+        """Re-sort and re-filter as a layout change rather than a reset: views keep the expansion,
+        selection and current row of every list that stays visible (their persistent indexes
+        follow it), those of lists the filter hides become invalid."""
+        self.layoutAboutToBeChanged[_WITH_HINT].emit([], _ROWS_MOVED)
+        before = self._visible
+        self._rebuild_visible()
+        now = {id(entry): row for row, entry in enumerate(self._visible)}
+        moved = [now.get(id(entry), -1) for entry in before]  # old row -> new row, -1 when hidden
+        sources = self.persistentIndexList()
+        targets = []
+        for index in sources:
+            list_id = index.internalId()
+            old = list_id - 1 if list_id else index.row()
+            row = moved[old] if 0 <= old < len(moved) else -1
+            if row < 0:
+                targets.append(QModelIndex())
+            elif list_id:
+                targets.append(self.createIndex(index.row(), index.column(), row + 1))
+            else:
+                targets.append(self.createIndex(row, index.column(), 0))
+        self.changePersistentIndexList(sources, targets)
+        self.layoutChanged[_WITH_HINT].emit([], _ROWS_MOVED)

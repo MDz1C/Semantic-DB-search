@@ -136,7 +136,11 @@ def make_fund_table(rows: int = 45_210):
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
     data = [list(r) for r in KNOWN_FUNDS]
     seen = {r[0] for r in data}
-    copies = {r[1]: 9 for r in data}  # flagship names stay unique
+    flagships = {r[1] for r in data}  # stay unique
+    copies: dict[str, int] = {}
+    # Listings per generated name: the lists above make 16,272 names, so 2 copies capped the table
+    # at 32,538 rows and the loop never ended.  Once nearly every name is used up, allow one more.
+    limit, misses = 3, 0
     while len(data) < rows:
         brokerage, prefixes, countries, classes = rng.choice(BRANDS)
         index, asset = rng.choice(INDICES)
@@ -144,8 +148,12 @@ def make_fund_table(rows: int = 45_210):
             index = index[5:]
         share_class = rng.choice(classes)
         name = " ".join(p for p in (rng.choice(prefixes), index, rng.choice(VARIANTS), share_class) if p)
-        if copies.get(name, 0) >= 2:
+        if name in flagships or copies.get(name, 0) >= limit:
+            misses += 1
+            if misses == 100_000:
+                limit, misses = limit + 1, 0
             continue
+        misses = 0
         body = rng.choice(countries) + "".join(rng.choice(alphabet) for _ in range(9))
         isin = body + isin_check_digit(body)
         if isin in seen:

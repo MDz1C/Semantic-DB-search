@@ -222,7 +222,7 @@ def refresh_bound() -> None:
 
 def stylesheet_icon(name: str, color: QColor) -> str:
     """Path of a themed SVG file for stylesheet ``image: url(...)`` rules (combo arrows, menu checks)."""
-    folder = Path(tempfile.gettempdir()) / "SemanticDBSearch-ui"
+    folder = Path(tempfile.gettempdir()) / "Fundscope-ui"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{name}-{color.name()[1:]}.svg"
     if not path.exists():

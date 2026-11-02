@@ -1,4 +1,4 @@
-"""Entry point: ``python -m semdb`` (and the frozen SemanticDBSearch.exe).
+"""Entry point: ``python -m semdb`` (and the frozen Fundscope.exe).
 
 ``--selftest`` runs a headless end-to-end check (model, import, index, search) and exits
 with status 0 on success; it is used to verify packaged builds.  ``--import-worker`` is the

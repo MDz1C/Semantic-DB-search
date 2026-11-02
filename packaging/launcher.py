@@ -1,4 +1,4 @@
-"""PyInstaller entry point for SemanticDBSearch.exe.
+"""PyInstaller entry point for Fundscope.exe.
 
 PyInstaller runs its entry script as a top-level ``__main__`` module, where the relative
 imports of ``src/semdb/__main__.py`` would fail; importing the package from here keeps them

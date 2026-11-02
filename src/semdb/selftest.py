@@ -1,4 +1,4 @@
-"""Headless end-to-end self-test: ``SemanticDBSearch.exe --selftest [--data-dir DIR] [--no-model]``.
+"""Headless end-to-end self-test: ``Fundscope.exe --selftest [--data-dir DIR] [--no-model]``.
 
 Exercises the packaged app without opening a window: loads the bundled embedding model,
 imports the bundled sample workbook, suggests column roles, saves and reloads the dataset,
@@ -171,19 +171,19 @@ class _Run:
 
 
 def run_selftest(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="SemanticDBSearch --selftest", add_help=False, exit_on_error=False)
+    parser = argparse.ArgumentParser(prog="Fundscope --selftest", add_help=False, exit_on_error=False)
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--no-model", action="store_true")
     try:
         options, _ = parser.parse_known_args(argv)
     except (argparse.ArgumentError, SystemExit):
-        _echo("usage: SemanticDBSearch --selftest [--data-dir DIR] [--no-model]")
+        _echo("usage: Fundscope --selftest [--data-dir DIR] [--no-model]")
         return 2
 
     temporary = options.data_dir is None
     if temporary:
-        data_dir = Path(tempfile.mkdtemp(prefix="SemanticDBSearch-selftest-"))
+        data_dir = Path(tempfile.mkdtemp(prefix="Fundscope-selftest-"))
     else:
         data_dir = options.data_dir.resolve()
     previous_data_dir = os.environ.get("SEMDB_DATA_DIR")

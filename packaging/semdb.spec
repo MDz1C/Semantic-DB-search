@@ -1,4 +1,4 @@
-# PyInstaller spec: one-folder, windowed Windows build of Semantic DB Search.
+# PyInstaller spec: one-folder, windowed Windows build of Fundscope.
 #
 #   .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean packaging\semdb.spec
 #       --distpath dist --workpath build\pyinstaller
@@ -20,7 +20,7 @@ SRC = ROOT / "src"
 MODEL = ROOT / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
 ASSETS = ROOT / "assets"
 LICENSES = Path(SPECPATH) / "licenses"
-NAME = "SemanticDBSearch"
+NAME = "Fundscope"
 PUBLISHER = "Manuel Dzimah"
 
 _package = (SRC / "semdb" / "__init__.py").read_text(encoding="utf-8")

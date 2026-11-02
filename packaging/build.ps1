@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Builds the Semantic DB Search installer, from a fresh checkout to dist\SemanticDBSearch-Setup-<version>.exe.
+    Builds the Fundscope installer, from a fresh checkout to dist\Fundscope-Setup-<version>.exe.
 
 .DESCRIPTION
     1. Python environment  .venv (created with "py -3.13" and requirements-dev.txt when missing)
     2. Embedding model     verified offline; downloaded and quantized by tools\fetch_model.py when missing
     3. Icon, sample data   generated when missing
     4. Tests               pytest (skip with -SkipTests)
-    5. Bundle              PyInstaller one-folder build -> dist\SemanticDBSearch
-    6. Self-test           the bundled SemanticDBSearch.exe --selftest must pass
-    7. Installer           Inno Setup 6 -> dist\SemanticDBSearch-Setup-<version>.exe
+    5. Bundle              PyInstaller one-folder build -> dist\Fundscope
+    6. Self-test           the bundled Fundscope.exe --selftest must pass
+    7. Installer           Inno Setup 6 -> dist\Fundscope-Setup-<version>.exe
 
     Works in Windows PowerShell 5.1 and PowerShell 7:
         powershell -ExecutionPolicy Bypass -File packaging\build.ps1 [-SkipTests]
@@ -27,8 +27,8 @@ Set-StrictMode -Version Latest
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
-$Bundle = Join-Path $Root 'dist\SemanticDBSearch'
-$AppExe = Join-Path $Bundle 'SemanticDBSearch.exe'
+$Bundle = Join-Path $Root 'dist\Fundscope'
+$AppExe = Join-Path $Bundle 'Fundscope.exe'
 $SelftestDir = Join-Path $Root 'build\selftest'
 $WarnFile = Join-Path $Root 'build\pyinstaller\semdb\warn-semdb.txt'
 $Started = Get-Date
@@ -79,7 +79,7 @@ $previousUnbuffered = $env:PYTHONUNBUFFERED
 $env:PYTHONUNBUFFERED = '1'  # stream Python output as it happens
 try {
     $Version = (Select-String -Path 'src\semdb\__init__.py' -Pattern '__version__ = "([^"]+)"').Matches[0].Groups[1].Value
-    Write-Host "Building Semantic DB Search $Version" -ForegroundColor White
+    Write-Host "Building Fundscope $Version" -ForegroundColor White
 
     Write-Step 1 'Python environment'
     if (-not (Test-Path $Python)) {
@@ -151,7 +151,7 @@ try {
 
     Write-Step 7 'Installer (Inno Setup)'
     Invoke-Native (Find-InnoSetupCompiler) @('/Qp', "/DAppVersion=$Version", 'packaging\installer.iss')
-    $installer = Get-Item "dist\SemanticDBSearch-Setup-$Version.exe"
+    $installer = Get-Item "dist\Fundscope-Setup-$Version.exe"
 
     Write-Host ''
     Write-Host ('Installer: {0}' -f $installer.FullName) -ForegroundColor Green

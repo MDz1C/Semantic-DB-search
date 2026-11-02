@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QGuiApplication
-from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
 from ..core.text import remove_spans, tokens as text_tokens
 from ..core.types import HistoryEntry, ResultRow
@@ -22,6 +22,8 @@ from .results_model import (
 from .widgets import Card, IconBadge, IconWidget, MeterBar, button, label
 
 PANEL_WIDTH = 360
+NO_RERUN = "Load a database to search again."
+NO_MEANING = "Meaning was not compared in this search: no language model, or the query only named an identity."
 
 
 def verdict(score: float) -> str:
@@ -48,6 +50,12 @@ def compared_text(entry: HistoryEntry) -> str:
     return remove_spans(entry.query, spans)
 
 
+def compared_meaning(entry: HistoryEntry) -> bool:
+    """Whether the search behind ``entry`` compared meaning: without the language model, or when
+    the query only named an identity, every result's semantic score is 0."""
+    return any((result.detail or {}).get("semantic") for result in entry.results)
+
+
 class DetailsPanel(Card):
     rerun_requested = Signal(list)  # query strings
     delete_requested = Signal(list)  # entry keys
@@ -60,7 +68,9 @@ class DetailsPanel(Card):
         self._columns: list[ColumnInfo] = []
         self._shown = 0
         self._key = ""
-        self.can_rerun = False
+        self._can_rerun = False
+        self._rerun_reason = ""
+        self._rerun: QPushButton | None = None  # the shown query's Re-run button
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1, 1, 1, 1)
         self._scroll = QScrollArea()
@@ -105,8 +115,31 @@ class DetailsPanel(Card):
         if self._entry is not None:
             self.show_entry(self._entry, self._result, self._columns, self._shown, self._key)
 
+    @property
+    def can_rerun(self) -> bool:
+        return self._can_rerun
+
+    @can_rerun.setter
+    def can_rerun(self, enabled: bool) -> None:
+        self.set_rerun(enabled)
+
+    def set_rerun(self, enabled: bool, reason: str = "") -> None:
+        """Whether Re-run can search now (``reason`` says why not); applies to the shown query at once."""
+        self._can_rerun, self._rerun_reason = bool(enabled), reason
+        if self._rerun is not None:
+            self._update_rerun(self._rerun)
+
+    def _update_rerun(self, rerun: QPushButton) -> None:
+        rerun.setEnabled(self._can_rerun)
+        rerun.setToolTip("" if self._can_rerun else self._rerun_reason or NO_RERUN)
+
+    def _shown_count(self, entry: HistoryEntry) -> int:
+        """How many results the list of ``entry`` shows: K, or all of them when it has fewer."""
+        return min(self._shown or len(entry.results), len(entry.results))
+
     # ------------------------------------------------------------------ building blocks
     def _new_body(self, center: bool = False) -> QVBoxLayout:
+        self._rerun = None  # setWidget deletes the previous body and its buttons
         content = QWidget()
         content.setObjectName("Transparent")
         body = QVBoxLayout(content)
@@ -160,7 +193,7 @@ class DetailsPanel(Card):
         self._entry, self._result = entry, result
         body = self._new_body()
         detail = result.detail or {}
-        body.addWidget(label(f"Result {result.rank} of {self._shown or len(entry.results)}  ·  Sheet row "
+        body.addWidget(label(f"Result {result.rank} of {self._shown_count(entry)}  ·  Sheet row "
                              f"{result.source_row}", "caption"))
         title = label(primary_value(entry, result), "heading", wrap=True, selectable=True)
         body.addWidget(title)
@@ -186,7 +219,11 @@ class DetailsPanel(Card):
         self._section(body, "Why it matched")
         bar = "accent"
         body.addWidget(self._meter("Text similarity", detail.get("text_score"), bar))
-        body.addWidget(self._meter("Meaning", detail.get("semantic"), bar))
+        compared = compared_meaning(entry)
+        meaning = self._meter("Meaning", detail.get("semantic") if compared else None, bar)
+        if not compared:
+            meaning.setToolTip(NO_MEANING)
+        body.addWidget(meaning)
         body.addWidget(self._meter("Exact words", detail.get("lexical"), bar))
         factor = detail.get("family_factor")
         body.addWidget(self._meter("Identity", factor, "success" if (factor or 0) >= 0.99 else "danger"))
@@ -251,9 +288,8 @@ class DetailsPanel(Card):
         body = self._new_body()
         body.addWidget(label(f"Query  ·  {relative_time(entry.created_at)}", "caption"))
         body.addWidget(label(entry.query, "heading", wrap=True, selectable=True))
-        shown = min(self._shown or len(entry.results), len(entry.results))
         best = f"  ·  best {percent(entry.results[0].score)}" if entry.results else ""
-        body.addWidget(label(f"{plural(shown, 'result')} shown{best}", "caption"))
+        body.addWidget(label(f"{plural(self._shown_count(entry), 'result')} shown{best}", "caption"))
 
         self._section(body, "Detected identity")
         if entry.evidence:
@@ -288,10 +324,9 @@ class DetailsPanel(Card):
         row = QHBoxLayout()
         row.setSpacing(8)
         rerun = button("Re-run", icon_name="refresh")
-        rerun.setEnabled(self.can_rerun)
-        if not self.can_rerun:
-            rerun.setToolTip("Load a database to search again.")
         rerun.clicked.connect(lambda: self.rerun_requested.emit([entry.query]))
+        self._rerun = rerun
+        self._update_rerun(rerun)
         delete = button("Delete", "danger-ghost", icon_name="trash")
         delete.clicked.connect(lambda: self.delete_requested.emit([self._key]))
         row.addWidget(rerun)

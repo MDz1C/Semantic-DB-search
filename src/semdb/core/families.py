@@ -11,8 +11,8 @@ from itertools import chain
 import numpy as np
 from rapidfuzz import fuzz, process
 
-from .text import is_identifier_column, ngrams, normalize, remove_spans, token_spans, tokens
-from .types import FamilyEvidence, Table
+from .text import is_identifier_column, looks_like_code, ngrams, normalize, remove_spans, token_spans, tokens
+from .types import CancelFn, Cancelled, FamilyEvidence, Table
 
 SMOOTHING = 2.0  # alpha of the smoothed text precision of value tokens and phrases
 GENERIC_VALUES = 3  # a token shared by more values than this is down-weighted (3 / nv)
@@ -32,6 +32,7 @@ ABBREVIATION_RATIO = 0.35
 ABBREVIATION_WEIGHT = 0.6
 MIN_FACTOR = 1e-3  # keeps factors in (0, 1] even at strictness 1
 MIN_INDICATOR_WEIGHT = 0.01  # weaker indicators can never reach MIN_STRENGTH: not stored
+_CANCEL_EVERY = 2000  # rows (or cheap items) between two polls of the cancel callback
 
 Staging = dict[str, dict[int, float]]  # key -> {value id: weight} while building
 Pattern = tuple[str, ...]  # a key split into tokens, matched against a cell's tokens
@@ -68,10 +69,15 @@ class _ColumnAux:
     alias_display: dict[str, str]  # learned alias token -> most common spelling in the data
 
 
+def _check(cancel: CancelFn | None) -> None:
+    if cancel is not None and cancel():
+        raise Cancelled()
+
+
 class _TextStats:
     """Token statistics of the search text; only needed while building."""
 
-    def __init__(self, table: Table, search: list[str]) -> None:
+    def __init__(self, table: Table, search: list[str], cancel: CancelFn | None = None) -> None:
         columns = [table.column_index(name) for name in search]
         vocab: dict[str, int] = {}
         per_cell: dict[str, tuple[list[str], str]] = {}
@@ -79,6 +85,8 @@ class _TextStats:
         pair_counts = np.zeros(len(table.rows), dtype=np.int64)
         row_text: list[str] = []
         for r, row in enumerate(table.rows):
+            if r % _CANCEL_EVERY == 0:
+                _check(cancel)
             row_tokens: list[str] = []
             parts: list[str] = []
             for j in columns:
@@ -159,13 +167,15 @@ def _add(staging: Staging, key: str, value: int, weight: float) -> None:
         entries[value] = weight
 
 
-def _vocabulary(raw: list[str]) -> tuple[np.ndarray, list[str], list[Pattern]]:
+def _vocabulary(raw: list[str], cancel: CancelFn | None = None) -> tuple[np.ndarray, list[str], list[Pattern]]:
     codes = np.full(len(raw), -1, dtype=np.int32)
     ids: dict[str, int] = {}
     values: list[str] = []
     value_tokens: list[Pattern] = []
     normalized: dict[str, str] = {}  # deciding values repeat a lot: normalize each once
     for r, cell in enumerate(raw):
+        if r % _CANCEL_EVERY == 0:
+            _check(cancel)
         key = normalized.get(cell)
         if key is None:
             key = normalized[cell] = normalize(cell)
@@ -181,16 +191,28 @@ def _vocabulary(raw: list[str]) -> tuple[np.ndarray, list[str], list[Pattern]]:
 
 
 def identifier_column(values: list[str]) -> bool:
-    """``text.is_identifier_column`` with a cheap exact pre-check for repetitive columns."""
+    """``text.is_identifier_column`` with cheap exact pre-checks for repetitive or wordy columns."""
     filled = [cell for cell in values if cell.strip()]
-    # Fewer distinct raw strings than 90 % can never pass (normalizing only merges values).
+    # Fewer distinct raw strings than 90 % can never pass (normalizing only merges values),
     if len(set(filled)) < 0.9 * len(filled):
         return False
+    # nor can fewer than 90 % code-like cells.  A wordy column (names) shows that within its
+    # first tenth, so only that many cells are counted: a code column then costs little extra.
+    misses = 0
+    for cell in filled[: len(filled) // 10 + 1000]:
+        if not looks_like_code(cell):
+            misses += 1
+            if len(filled) - misses < 0.9 * len(filled):
+                return False
     return is_identifier_column(values)
 
 
-def _identifier_indicators(indicators: Staging, value_tokens: list[Pattern], stats: _TextStats) -> None:
+def _identifier_indicators(
+    indicators: Staging, value_tokens: list[Pattern], stats: _TextStats, cancel: CancelFn | None = None
+) -> None:
     for value_id, toks in enumerate(value_tokens):
+        if value_id % _CANCEL_EVERY == 0:
+            _check(cancel)
         phrase, compact = " ".join(toks), "".join(toks)
         if any(ch.isdigit() for ch in compact) or len(compact) >= 5:
             weight = 1.0
@@ -247,11 +269,13 @@ def _phrase_indicators(
     best: list[float],
     codes: np.ndarray,
     stats: _TextStats,
+    cancel: CancelFn | None = None,
 ) -> None:
     padded = [" " + " ".join(toks) + " " for toks in value_tokens]
     for value_id, toks in enumerate(value_tokens):
         if len(toks) < 2:
             continue
+        _check(cancel)  # a phrase may scan many rows
         needle = padded[value_id]
         rarest = min(toks, key=lambda t: len(token_values[t]))
         holders = [u for u in token_values[rarest] if needle in padded[u]]
@@ -269,6 +293,7 @@ def _learn_aliases(
     codes: np.ndarray,
     pairs: _PairCounts,
     stats: _TextStats,
+    cancel: CancelFn | None = None,
 ) -> dict[int, list[str]]:
     """Text tokens that (almost) only occur in one family's rows become indicators of it."""
     filled = codes[codes >= 0]
@@ -290,13 +315,17 @@ def _learn_aliases(
         _add(indicators, token, value_id, weight)
         mined.setdefault(value_id, []).append((-weight, -n, token))
 
-    for value_id, token_id, n, cov, prec in zip(
-        value_of[keep].tolist(),
-        token_of[keep].tolist(),
-        support[keep].tolist(),
-        coverage[keep].tolist(),
-        precision[keep].tolist(),
+    for i, (value_id, token_id, n, cov, prec) in enumerate(
+        zip(
+            value_of[keep].tolist(),
+            token_of[keep].tolist(),
+            support[keep].tolist(),
+            coverage[keep].tolist(),
+            precision[keep].tolist(),
+        )
     ):
+        if i % _CANCEL_EVERY == 0:
+            _check(cancel)
         token = stats.words[token_id]
         if len(token) < 3 or token.isdigit() or token in value_tokens[value_id]:
             continue
@@ -313,7 +342,9 @@ def _learn_aliases(
                 for value_id, weight in entries.items():
                     if weight >= CUT_WEIGHT:
                         strong.setdefault(value_id, []).append(key)
-        for value_id, token, n, cov, prec in rare:
+        for i, (value_id, token, n, cov, prec) in enumerate(rare):
+            if i % _CANCEL_EVERY == 0:
+                _check(cancel)
             if any(_is_spelling_variant(token, key) for key in strong.get(value_id, ())):
                 factor = max(ABBREVIATION_WEIGHT, 0.5 + 0.5 * min(1.0, cov / ALIAS_FULL_COVERAGE))
                 learn(value_id, token, n, prec * factor)
@@ -321,13 +352,19 @@ def _learn_aliases(
 
 
 def _alias_display(
-    table: Table, search: list[str], codes: np.ndarray, learned: dict[int, list[str]], stats: _TextStats
+    table: Table,
+    search: list[str],
+    codes: np.ndarray,
+    learned: dict[int, list[str]],
+    stats: _TextStats,
+    cancel: CancelFn | None = None,
 ) -> dict[str, str]:
     """Most common original spelling of each learned alias among its family's rows."""
     columns = [table.column_index(name) for name in search]
     display: dict[str, str] = {}
     for value_id, aliases in learned.items():
         for alias in aliases:
+            _check(cancel)
             rows = stats.rows_with(stats.vocab[alias])
             spellings: Counter[str] = Counter()
             for r in rows[codes[rows] == value_id][:50].tolist():
@@ -355,21 +392,23 @@ def _removals(indicators: Staging, value_tokens: list[Pattern]) -> list[dict[str
 
 
 def _build_column(
-    table: Table, name: str, search: list[str], stats: _TextStats
+    table: Table, name: str, search: list[str], stats: _TextStats, cancel: CancelFn | None = None
 ) -> tuple[DecidingColumn, _ColumnAux]:
     raw = table.column_values(name)
-    codes, values, value_tokens = _vocabulary(raw)
+    codes, values, value_tokens = _vocabulary(raw, cancel)
+    _check(cancel)
     is_identifier = identifier_column(raw)
+    _check(cancel)
     indicators: Staging = {}
     learned: dict[int, list[str]] = {}
     if is_identifier:
-        _identifier_indicators(indicators, value_tokens, stats)
+        _identifier_indicators(indicators, value_tokens, stats, cancel)
         aux = _ColumnAux(value_tokens, None, [], {}, {})
     else:
         pairs = _PairCounts(codes, stats)
         token_values, best = _value_token_indicators(indicators, value_tokens, pairs, stats)
-        _phrase_indicators(indicators, value_tokens, token_values, best, codes, stats)
-        learned = _learn_aliases(indicators, value_tokens, codes, pairs, stats)
+        _phrase_indicators(indicators, value_tokens, token_values, best, codes, stats, cancel)
+        learned = _learn_aliases(indicators, value_tokens, codes, pairs, stats, cancel)
         unigrams = [key for key in indicators if " " not in key]
         abbreviation_keys: dict[str, list[str]] = {}
         for key in unigrams:
@@ -379,8 +418,9 @@ def _build_column(
             removals=_removals(indicators, value_tokens),
             typo_keys=[key for key in unigrams if len(key) >= 4],
             abbreviation_keys=abbreviation_keys,
-            alias_display=_alias_display(table, search, codes, learned, stats),
+            alias_display=_alias_display(table, search, codes, learned, stats, cancel),
         )
+    _check(cancel)
     codes.flags.writeable = False
     final = {key: sorted(entries.items()) for key, entries in indicators.items()}
     return DecidingColumn(name, values, codes, is_identifier, final, learned), aux
@@ -437,16 +477,22 @@ class FamilyModel:
         self._n_rows = n_rows
 
     @classmethod
-    def build(cls, table: Table, deciding: list[str], search: list[str]) -> "FamilyModel":
+    def build(
+        cls, table: Table, deciding: list[str], search: list[str], *, cancel: CancelFn | None = None
+    ) -> "FamilyModel":
+        """``cancel`` is polled throughout (every few tens of milliseconds on 45k rows); when
+        it returns True, ``Cancelled`` is raised."""
         if not deciding:
             return cls([], [], {}, {}, len(table.rows))
-        stats = _TextStats(table, search)
+        stats = _TextStats(table, search, cancel)
         columns: list[DecidingColumn] = []
         aux: list[_ColumnAux] = []
         for name in deciding:
-            column, extra = _build_column(table, name, search, stats)
+            _check(cancel)
+            column, extra = _build_column(table, name, search, stats, cancel)
             columns.append(column)
             aux.append(extra)
+        _check(cancel)
         key_tokens = {token for column in columns for key in column.indicators for token in key.split(" ")}
         key_rows = {t: stats.rows_with(stats.vocab[t]) for t in key_tokens if t in stats.vocab}
         df_text = dict(zip(stats.words, stats.df.tolist()))

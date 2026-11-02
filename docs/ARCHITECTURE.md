@@ -1,4 +1,4 @@
-# Semantic DB Search — Architecture & Specification
+# Fundscope — Architecture & Specification
 
 This document is the single source of truth for how the app works. Code must match it;
 if an implementation needs to deviate, the deviation is documented here.
@@ -380,6 +380,12 @@ float)`, `done(object)`, `failed(str)`); cancellation through a `threading.Event
 embedder and the stored dataset and rebuild the index in the background (embedding cache → seconds).
 Only one index build at a time; a newer build supersedes an older one (cancel + restart). Never
 block the UI thread for more than ~50 ms.
+Results tree at scale: every full layout measures each row once (the dataset columns are hidden
+during `doItemsLayout`, so the O(1) delegate `sizeHint` runs once per row, not per column); sort and
+filter use layout changes instead of model resets; expand/collapse-all and expansion restore emit one
+signal per batch. Measured with 153 lists × 50 results all expanded: sort/filter return in 1–3 ms,
+expand-all plus its layout ≈ 115–140 ms (was up to 1.6 s). Known residual: loading the model at
+startup holds the GIL for ~0.5 s (onnxruntime import, tokenizer parse).
 
 ## 13. Security & privacy (R1)
 
@@ -389,17 +395,17 @@ block the UI thread for more than ~50 ms.
 * Files are parsed by memory-safe calamine in an isolated, memory-capped worker process (§4); no
   macros or formulas are executed, and a malicious file can neither crash the app nor exhaust RAM.
 * Exports never turn cell text into formulas (formula injection).
-* All state is per-user in `%LOCALAPPDATA%\SemanticDBSearch`; the installer offers to delete it on
+* All state is per-user in `%LOCALAPPDATA%\Fundscope`; the installer offers to delete it on
   uninstall. SQL is always parameterised. No pickle anywhere.
 
 ## 14. Packaging
 
 `packaging/build.ps1` → fetch/verify model → icon + sample data → tests → PyInstaller one-folder,
-windowed build (`packaging/semdb.spec`, name `SemanticDBSearch`, version resource, icon) → selftest of
+windowed build (`packaging/semdb.spec`, name `Fundscope`, version resource, icon) → selftest of
 the frozen exe (`--selftest`, exit code 0) → Inno Setup (`packaging/installer.iss`): per-user install
 without admin rights (`PrivilegesRequired=lowest`, `{autopf}`), Start-menu shortcut, optional desktop
 shortcut, launch after install, uninstaller that optionally removes user data, LZMA2 solid
-compression. Output: `dist/SemanticDBSearch-Setup-<version>.exe`.
+compression. Output: `dist/Fundscope-Setup-<version>.exe`.
 
 ## 15. Quality bar
 

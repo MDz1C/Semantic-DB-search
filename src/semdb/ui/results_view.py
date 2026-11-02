@@ -7,6 +7,9 @@ rank + score, then the dataset columns with identity pills for deciding columns.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from PySide6.QtCore import (
     QEvent,
     QItemSelection,
@@ -57,6 +60,10 @@ RANK_W = 18
 CELL_PAD = 12
 SCORE_W = 48
 MATCH_COLUMN_W = INDENT + RANK_W + 10 + SCORE_W + 14
+# Row size hints (copied by Qt; shared so a layout does not build thousands of them)
+QUERY_SIZE = QSize(200, QUERY_ROW_H)
+RESULT_SIZE = QSize(120, RESULT_ROW_H)
+LAST_RESULT_SIZE = QSize(120, RESULT_ROW_H + GROUP_GAP)
 
 
 def elide(metrics: QFontMetricsF, text: str, width: float) -> str:
@@ -72,6 +79,7 @@ class ResultsDelegate(QStyledItemDelegate):
     def __init__(self, view: ResultsView) -> None:
         super().__init__(view)
         self._view = view
+        self._model = view.results_model()
         self.f_query = theme.font(theme.BASE_PT, QFont.Weight.DemiBold)
         self.f_body = theme.font(theme.BASE_PT)
         self.f_caption = theme.font(theme.CAPTION_PT)
@@ -83,11 +91,10 @@ class ResultsDelegate(QStyledItemDelegate):
 
     # ------------------------------------------------------------------ sizes
     def sizeHint(self, option, index: QModelIndex) -> QSize:  # noqa: N802
-        model = self._view.results_model()
-        if model.is_query(index):
-            return QSize(200, QUERY_ROW_H)
-        last = index.row() == model.rowCount(index.parent()) - 1
-        return QSize(120, RESULT_ROW_H + (GROUP_GAP if last else 0))
+        """Depends on the row kind only (layouts ask once per visible row): no model round trips."""
+        if not index.internalId():
+            return QUERY_SIZE
+        return LAST_RESULT_SIZE if self._model.is_last_result(index) else RESULT_SIZE
 
     def paint(self, painter: QPainter, option, index: QModelIndex) -> None:
         model = self._view.results_model()
@@ -334,6 +341,7 @@ class ResultsView(QTreeView):
         super().__init__(parent)
         self.setObjectName("Results")
         self._model = model
+        self._narrow = False  # a full layout measuring the match column only is running
         self._delegate = ResultsDelegate(self)
         self._header = ResultsHeader(self)
         self.setHeader(self._header)
@@ -368,6 +376,8 @@ class ResultsView(QTreeView):
         self._column_signature: tuple[str, ...] = ()
         model.modelAboutToBeReset.connect(self._capture_state)
         model.modelReset.connect(self._restore_state)
+        model.layoutChanged.connect(self._on_layout_changed)
+        model.times_changed.connect(self.viewport().update)
         self.expanded.connect(self._on_expanded)
         self.collapsed.connect(self._on_collapsed)
         self.selectionModel().currentChanged.connect(self._on_current_changed)
@@ -417,6 +427,33 @@ class ResultsView(QTreeView):
             if x + size <= 0 or x >= width:
                 continue
             self._delegate.paint_result_cell(painter, QRect(x, top, size, RESULT_ROW_H), logical, entry, result, model)
+
+    # ------------------------------------------------------------------ layout
+    def doItemsLayout(self) -> None:  # noqa: N802
+        """Lay every visible row out again (resets, layout changes, collapse all...).
+
+        The tree measures a row by asking the delegate about each of its cells, Python calls per
+        row and column; heights depend on the row kind alone, so the dataset columns are hidden
+        while it runs (hidden sections are skipped) and come back at the same widths."""
+        header = self.header()
+        others = [c for c in range(1, header.count()) if not header.isSectionHidden(c)]
+        if self._narrow or not others:
+            super().doItemsLayout()
+            return
+        scroll = self.horizontalScrollBar().value()
+        blocked = header.blockSignals(True)  # the widths end as they were: nothing to report
+        self._narrow = True
+        try:
+            for column in others:
+                header.setSectionHidden(column, True)
+            super().doItemsLayout()
+        finally:
+            for column in others:
+                header.setSectionHidden(column, False)
+            self._narrow = False
+            header.blockSignals(blocked)
+        self.updateGeometries()  # scroll ranges for the full width again
+        self.horizontalScrollBar().setValue(scroll)
 
     # ------------------------------------------------------------------ columns
     def apply_column_widths(self, force: bool = False) -> None:
@@ -470,7 +507,7 @@ class ResultsView(QTreeView):
         """Let the primary column absorb spare width until the user resizes a column; it never
         shrinks below its fitted content width (the other columns scroll instead)."""
         columns = self._model.columns()
-        if not self._auto_fit or not columns:
+        if not self._auto_fit or not columns or self._narrow:  # (hidden columns measure 0 meanwhile)
             return
         header = self.header()
         others = sum(header.sectionSize(i) for i in range(header.count()) if i != 1)
@@ -509,33 +546,64 @@ class ResultsView(QTreeView):
 
     def _restore_state(self) -> None:
         model = self._model
-        rows = {model.data(model.index(r, 0), KEY_ROLE): r for r in range(model.rowCount())}
-        keys = self._expanded_keys & rows.keys()
-        for key in keys:
-            self.setExpanded(model.index(rows[key], 0), True)
+        reopened = self._reopen()
         selection = QItemSelection()
         for key, rank in self._saved_selection:
-            index = self._locate(rows, key, rank)
+            index = self._locate(key, rank)
             if index.isValid():
                 selection.select(index, index.siblingAtColumn(model.columnCount() - 1))
         flags = QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
-        current = self._locate(rows, *self._saved_current) if self._saved_current else QModelIndex()
+        current = self._locate(*self._saved_current) if self._saved_current else QModelIndex()
         if current.isValid():
             self.selectionModel().setCurrentIndex(current, QItemSelectionModel.SelectionFlag.NoUpdate)
         self.selectionModel().select(selection, flags)
-        self.doItemsLayout()
+        self.executeDelayedItemsLayout()  # unless scrolling to the restored current row already did
         self.verticalScrollBar().setValue(self._saved_scroll)
-        self.expansion_changed.emit()
+        self._announce(reopened, True)
 
-    def _locate(self, rows: dict[str, int], key: str, rank: int | None) -> QModelIndex:
-        if key not in rows:
-            return QModelIndex()
-        parent = self._model.index(rows[key], 0)
-        if rank is None:
+    def _locate(self, key: str, rank: int | None) -> QModelIndex:
+        parent = self._model.query_index(key)
+        if rank is None or not parent.isValid():
             return parent
-        if rank - 1 < self._model.rowCount(parent):
-            return self._model.index(rank - 1, 0, parent)
-        return QModelIndex()
+        return self._model.index(rank - 1, 0, parent)  # invalid when the list now shows fewer results
+
+    def _on_layout_changed(self) -> None:
+        """Sorting and filtering keep the expansion of every list that stays visible; the lists a
+        filter brings back reopen when they were open before it hid them."""
+        self._announce(self._reopen(), True)
+
+    def _reopen(self) -> QModelIndex | None:
+        """Expand the shown lists remembered as open that the tree has closed; the first of them."""
+        model = self._model
+        closed = [index for index in map(model.query_index, self._expanded_keys & model.visible_keys())
+                  if not self.isExpanded(index)]
+        if not closed:
+            return None
+        self._open_quietly(closed)
+        return min(closed, key=QModelIndex.row)
+
+    def _open_quietly(self, indexes: list[QModelIndex]) -> None:
+        """Expand ``indexes`` with one layout for all and no per-list signals (see _announce)."""
+        self.scheduleDelayedItemsLayout()  # the tree then only records each expansion
+        with self._quiet():
+            for index in indexes:
+                self.setExpanded(index, True)
+
+    @contextmanager
+    def _quiet(self) -> Iterator[None]:
+        blocked = self.blockSignals(True)
+        try:
+            yield
+        finally:
+            self.blockSignals(blocked)
+
+    def _announce(self, index: QModelIndex | None, expanded: bool) -> None:
+        """Report a batch once: as the view's own signal for one changed list (so listeners of
+        expanded/collapsed and of expansion_changed each run once), or as expansion_changed."""
+        if index is None:
+            self.expansion_changed.emit()
+        else:
+            (self.expanded if expanded else self.collapsed).emit(index)
 
     def _on_expanded(self, index: QModelIndex) -> None:
         key = self._model.data(index, KEY_ROLE)
@@ -552,17 +620,27 @@ class ResultsView(QTreeView):
 
     # ------------------------------------------------------------------ expansion helpers
     def any_expanded(self) -> bool:
-        model = self._model
-        return any(self.isExpanded(model.index(r, 0)) for r in range(model.rowCount()))
+        """No per-row work: the tree has open exactly the shown lists whose keys are remembered."""
+        return not self._expanded_keys.isdisjoint(self._model.visible_keys())
 
     def expand_all_lists(self) -> None:
-        self.expandAll()
-        self.expansion_changed.emit()
+        closed = [index for index in self._lists() if not self.isExpanded(index)]
+        if closed:
+            self._open_quietly(closed)
+            self.executeDelayedItemsLayout()
+        self._expanded_keys.update(self._model.visible_keys())
+        self._announce(closed[0] if closed else None, True)
 
     def collapse_all_lists(self) -> None:
-        self.collapseAll()
+        opened = next((index for index in self._lists() if self.isExpanded(index)), None)
+        with self._quiet():  # collapseAll would report every list it closes
+            self.collapseAll()
         self._expanded_keys.clear()
-        self.expansion_changed.emit()
+        self._announce(opened, False)
+
+    def _lists(self) -> list[QModelIndex]:
+        model = self._model
+        return [model.index(row, 0) for row in range(model.rowCount())]
 
     def toggle(self, index: QModelIndex) -> None:
         index = index.siblingAtColumn(0)
@@ -706,6 +784,7 @@ class ResultsView(QTreeView):
             copy_primary = popup.addAction(f"Copy “{short}”")
             copy_primary.triggered.connect(lambda: QGuiApplication.clipboard().setText(title))
         popup.exec(event.globalPos())
+        popup.deleteLater()  # with its actions and the entries their slots hold
 
     def _copy_results(self, entries: list[HistoryEntry]) -> None:
         k = self._model.k

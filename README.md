@@ -1,7 +1,11 @@
-# Semantic DB Search
+# Fundscope
 
-An installable Windows desktop app that finds the rows of your spreadsheet database that
-best match each line you paste — intelligently. It understands meaning (abbreviations,
+<img src="assets/icon.png" alt="Fundscope logo: a magnifying glass whose rising stock line breaks out through the lens" width="96" align="right">
+
+**Find any fund in your database — even when the names don't match.**
+
+Fundscope is an installable Windows desktop app that finds the rows of your spreadsheet
+database that best match each line you paste — intelligently. It understands meaning (abbreviations,
 typos, Spanish ↔ English), stays exact where it matters (`S&P 500` is not `S&P 400`, an ISIN
 is an ISIN), and never mixes up the identities you mark as **deciding**: a query for an
 *iShares* fund will not return a *Vanguard* fund first just because more of the other words
@@ -11,7 +15,7 @@ happen to overlap.
 no open network port, no internet connection. Your database, queries and results never leave
 your computer.
 
-![Semantic DB Search: one collapsible result list per query, identity agreement shown per row, and why each match ranked where it did](docs/screenshot.png)
+![Fundscope: one collapsible result list per query, identity agreement shown per row, and why each match ranked where it did](docs/screenshot.png)
 
 ## Features
 
@@ -34,11 +38,15 @@ your computer.
 
 ## Install
 
-Download `SemanticDBSearch-Setup-1.0.0.exe` and run it. It installs for your user account only
+Download `Fundscope-Setup-1.0.0.exe` and run it. It installs for your user account only
 (no administrator rights needed) and adds a Start-menu entry. Uninstall it from *Settings → Apps*;
 the uninstaller asks whether to also delete your saved data.
 
-Requirements: Windows 10 or 11, 64-bit. The installer is 113 MB; the installed app takes about
+The installer is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC":
+choose **More info → Run anyway**. Installing over an earlier build (including one from when the
+app was called *Semantic DB Search*) upgrades it in place and keeps your saved results.
+
+Requirements: Windows 10 or 11, 64-bit. The installer is 114 MB; the installed app takes about
 250 MB (most of it is the bundled language model and Qt).
 
 ## How to use it
@@ -106,7 +114,7 @@ and a few seconds afterwards.
   in a separate, memory-capped helper process: macros and formulas are never executed, and a
   malicious or broken spreadsheet cannot crash the app or exhaust your computer's memory.
 - Exports never turn text into Excel formulas (protection against formula injection).
-- Your data lives in `%LOCALAPPDATA%\SemanticDBSearch` (open it from the **⋯** menu).
+- Your data lives in `%LOCALAPPDATA%\Fundscope` (open it from the **⋯** menu).
 
 ## Building from source
 

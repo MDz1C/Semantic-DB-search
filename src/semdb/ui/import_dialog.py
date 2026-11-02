@@ -99,6 +99,8 @@ class ImportDialog(Dialog):
         self.header_stepper = Stepper(1, MAX_HEADER_ROW, 1)
         self.header_stepper.setToolTip("Row that holds the column names (detected automatically)")
         self.header_stepper.valueChanged.connect(self._on_header_changed)
+        self.header_stepper.spin_box().editingFinished.connect(self._apply_header)
+        self._header_value = self.header_stepper.value()  # as last handled: Enter re-emits it unchanged
         options.addWidget(self._sheet_label)
         options.addWidget(self.sheet_combo)
         options.addSpacing(16)
@@ -215,11 +217,11 @@ class ImportDialog(Dialog):
 
     # ------------------------------------------------------------------ loading
     def _load(self, sheet: str | None, header_row: int | None) -> None:
+        self._header_timer.stop()  # this request replaces a header-row change still waiting
         if self._task is not None:
             self._task.cancel()
         self._pages.setCurrentWidget(self._loading_page)
         self._loading_bar.set_value(None)
-        self.import_button.setEnabled(False)
         self._generation += 1
         generation = self._generation
         path, backend = self._path, self._backend
@@ -238,6 +240,7 @@ class ImportDialog(Dialog):
             on_failed=current(self._on_failed),
             on_progress=current(self._on_progress),
         )
+        self._validate()
 
     def _on_progress(self, message: str, fraction: float) -> None:
         self._loading_text.setText(message if message else f"Reading {self._path.name}…")
@@ -248,6 +251,7 @@ class ImportDialog(Dialog):
         self._error_text.setText(message)
         self._pages.setCurrentWidget(self._error_page)
         self._options.setEnabled(bool(self._preview))
+        self._validate()
 
     def _on_loaded(self, preview: ImportPreview) -> None:
         self._task = None
@@ -264,9 +268,11 @@ class ImportDialog(Dialog):
         multiple = len(preview.sheets) > 1
         self._sheet_label.setVisible(multiple)
         self.sheet_combo.setVisible(multiple)
-        self.header_stepper.blockSignals(True)
-        self.header_stepper.setValue(preview.header_row + 1)
-        self.header_stepper.blockSignals(False)
+        if not self._header_timer.isActive():  # else keep the row typed while this was read
+            self.header_stepper.blockSignals(True)
+            self.header_stepper.setValue(preview.header_row + 1)
+            self.header_stepper.blockSignals(False)
+            self._header_value = self.header_stepper.value()
         self._options.setEnabled(True)
 
         model = PreviewModel(table)
@@ -286,32 +292,58 @@ class ImportDialog(Dialog):
         for column in range(header.count()):
             header.resizeSection(column, max(80, min(260, header.sectionSize(column) + 16)))
 
+    def _is_current(self) -> bool:
+        """True when the preview on screen is what the sheet and header-row controls ask for."""
+        preview = self._preview
+        return (
+            preview is not None
+            and self._task is None
+            and not self._header_timer.isActive()
+            and self._pages.currentWidget() is self._content_page
+            and self.sheet_combo.currentText() == preview.sheet
+            and self.header_stepper.value() == preview.header_row + 1
+        )
+
     def _on_sheet_changed(self, sheet: str) -> None:
-        if self._preview is not None and sheet != self._preview.sheet:
+        if self._preview is not None and not self._is_current():
             self._load(sheet, None)
 
-    def _on_header_changed(self, _value: int) -> None:
+    def _on_header_changed(self, value: int) -> None:
+        if value == self._header_value:
+            return
+        self._header_value = value
         self._header_timer.start()
+        self._validate()  # Import waits for the preview of the new row
+
+    def _apply_header(self) -> None:
+        """Enter (or leaving the field) applies a typed header row without waiting for the pause."""
+        if self._header_timer.isActive():
+            self._reload_header()
 
     def _reload_header(self) -> None:
-        if self._preview is not None:
-            self._load(self._preview.sheet, self.header_stepper.value() - 1)
+        self._header_timer.stop()
+        if self._preview is None or self._is_current():
+            self._validate()  # back on the row already shown
+        else:
+            self._load(self.sheet_combo.currentText(), self.header_stepper.value() - 1)
 
     # ------------------------------------------------------------------ accept
     def _validate(self) -> None:
-        valid = self._preview is not None and self.editor.is_valid()
-        self._invalid.setVisible(self._preview is not None and not valid)
-        self.import_button.setEnabled(valid and self._task is None)
+        valid = self.editor.is_valid()
+        self._invalid.setVisible(self._pages.currentWidget() is self._content_page and not valid)
+        self.import_button.setEnabled(valid and self._is_current())
 
     def _accept(self) -> None:
-        if self._preview is None or not self.editor.is_valid():
+        preview = self._preview
+        if preview is None or not self._is_current() or not self.editor.is_valid():
             return
-        self.table = self._preview.table
+        self.table = preview.table
         self.roles = self.editor.roles()
         self.accept()
 
     def done(self, result: int) -> None:
         self._open = False
+        self._header_timer.stop()
         if self._task is not None:
             self._task.cancel()
         super().done(result)

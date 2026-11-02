@@ -1,20 +1,20 @@
-; Inno Setup 6.7 script for the Semantic DB Search installer.
+; Inno Setup 6.7 script for the Fundscope installer.
 ;
-; packaging\build.ps1 compiles it after PyInstaller has produced dist\SemanticDBSearch:
+; packaging\build.ps1 compiles it after PyInstaller has produced dist\Fundscope:
 ;   ISCC.exe /DAppVersion=1.0.0 packaging\installer.iss
-; -> dist\SemanticDBSearch-Setup-<version>.exe
+; -> dist\Fundscope-Setup-<version>.exe
 ;
 ; Installs per user without administrator rights (an all-users install can be chosen in the
-; privileges dialog). User data lives in %LOCALAPPDATA%\SemanticDBSearch, never in the program
+; privileges dialog). User data lives in %LOCALAPPDATA%\Fundscope, never in the program
 ; folder; the uninstaller offers to delete it.
 
 #ifndef AppVersion
   #define AppVersion "1.0.0"
 #endif
-#define AppName "Semantic DB Search"
+#define AppName "Fundscope"
 #define AppPublisher "Manuel Dzimah"
-#define AppExeName "SemanticDBSearch.exe"
-#define DataFolderName "SemanticDBSearch"
+#define AppExeName "Fundscope.exe"
+#define DataFolderName "Fundscope"
 
 [Setup]
 ; The AppId identifies the app across upgrades: never change it.
@@ -30,8 +30,8 @@ VersionInfoDescription={#AppName} Setup
 ; Every path below is relative to the repository root.
 SourceDir=..
 OutputDir=dist
-OutputBaseFilename=SemanticDBSearch-Setup-{#AppVersion}
-DefaultDirName={autopf}\Semantic DB Search
+OutputBaseFilename=Fundscope-Setup-{#AppVersion}
+DefaultDirName={autopf}\Fundscope
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -55,13 +55,17 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [InstallDelete]
 ; An upgrade replaces the whole bundle, so no library of an older version is left behind.
 Type: filesandordirs; Name: "{app}\_internal"
+; Builds released before the Fundscope name used another executable and shortcut name.
+Type: files; Name: "{app}\SemanticDBSearch.exe"
+Type: files; Name: "{autoprograms}\Semantic DB Search.lnk"
+Type: files; Name: "{autodesktop}\Semantic DB Search.lnk"
 
 [Files]
-Source: "dist\SemanticDBSearch\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\Fundscope\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Comment: "Search your spreadsheets offline"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Comment: "Search your spreadsheets offline"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Comment: "Find any fund in your spreadsheet database, offline"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Comment: "Find any fund in your spreadsheet database, offline"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

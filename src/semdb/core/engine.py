@@ -48,9 +48,12 @@ CELL_SEPARATOR = " · "
 IDENTITY_ONLY_TEXT_SCORE = 0.5  # the query only named an identity: rank by identity
 MATCH_BETA = 3.0  # lexical F-beta: covering the query matters 9x more than the column's extra words
 FIELD_SHARE = 0.65  # lexical score = best column's F-beta, the rest = recall over the whole row
-_EMBED_CHUNK = 1024  # rows per encode call; each chunk is cached as soon as it is done
+# Texts per encode call.  Each chunk is cached as soon as it is done, so a cancelled build keeps
+# all but the chunk in progress (< 0.2 s of model time); the real model is as fast as with 1,024.
+_EMBED_CHUNK = 256
+_LOOKUP_CHUNK = 1024  # texts per embedding-cache lookup (~20-50 ms each), cancel polled between
 _QUERY_EMBED_SHARE = 0.1  # share of the search progress bar spent embedding queries
-_CANCEL_EVERY = 2000
+_CANCEL_EVERY = 1000  # rows between two polls of the cancel callback (< ~50 ms on wide 45k tables)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,13 +150,14 @@ class SearchIndex:
         _check(cancel)
 
         report(STAGE_ALIASES, 0.0)
-        family = FamilyModel.build(table, deciding, search) if config.use_family else None
+        family = FamilyModel.build(table, deciding, search, cancel=cancel) if config.use_family else None
         _check(cancel)
         fields = _field_texts(table, text_columns, family if search else None, report, cancel)
         if fields:
             row_texts = [CELL_SEPARATOR.join(cell for cell in cells if cell) for cells in zip(*fields)]
         else:
             row_texts = [""] * len(table.rows)
+        _check(cancel)
 
         report(STAGE_INDEX, 0.0)
         field_indexes = []
@@ -174,6 +178,7 @@ class SearchIndex:
         known = {column.name: column.is_identifier for column in family.columns} if family else {}
 
         def is_identifier(name: str) -> bool:
+            _check(cancel)
             return known[name] if name in known else identifier_column(table.column_values(name))
 
         id_columns = [
@@ -181,7 +186,8 @@ class SearchIndex:
             for name in table.columns
             if role_of[name] in (Role.DECIDING, Role.SEARCH) and is_identifier(name)
         ]
-        ids, ambiguous = _id_lookup(table, id_columns, [c for c in text_columns if c not in id_columns])
+        ids, ambiguous = _id_lookup(table, id_columns, [c for c in text_columns if c not in id_columns], cancel)
+        _check(cancel)
         report(STAGE_FINAL, 1.0)
 
         index = cls.__new__(cls)
@@ -438,11 +444,17 @@ def _embed_rows(
     report: ProgressFn,
     cancel: CancelFn | None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """(unique vectors, per-row index into them); empty texts share a zero vector."""
+    """(unique vectors, per-row index into them); empty texts share a zero vector.
+
+    The cache is read and the missing texts embedded in chunks, polling ``cancel`` between
+    them, and each embedded chunk is cached at once: a cancelled build leaves all its finished
+    chunks to the next one."""
     position: dict[str, int] = {}
     unique: list[str] = []
     text_ids = np.empty(len(row_texts), dtype=np.int32)
     for r, text in enumerate(row_texts):
+        if r % _CANCEL_EVERY == 0:
+            _check(cancel)
         if not text:
             text_ids[r] = -1
             continue
@@ -455,16 +467,20 @@ def _embed_rows(
     vectors = np.zeros((len(unique) + 1, embedder.dim), dtype=np.float32)  # last row: empty text
     text_ids[text_ids < 0] = len(unique)
 
-    cached = cache.get_many(embedder.model_id, unique) if cache is not None and unique else {}
-    have = np.zeros(len(unique), dtype=bool)
-    for i, vector in cached.items():
-        vector = np.asarray(vector, dtype=np.float32).reshape(-1)
-        if vector.shape == (embedder.dim,) and np.all(np.isfinite(vector)):
-            vectors[i] = vector
-            have[i] = True
-    missing = sorted(np.flatnonzero(~have).tolist(), key=lambda i: len(unique[i]))
     total = max(len(unique), 1)
-    done = len(unique) - len(missing)
+    have = np.zeros(len(unique), dtype=bool)
+    done = 0
+    if cache is not None:
+        for first in range(0, len(unique), _LOOKUP_CHUNK):
+            _check(cancel)
+            for i, vector in cache.get_many(embedder.model_id, unique[first : first + _LOOKUP_CHUNK]).items():
+                vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+                if vector.shape == (embedder.dim,) and np.all(np.isfinite(vector)):
+                    vectors[first + i] = vector
+                    have[first + i] = True
+                    done += 1
+            report(STAGE_EMBED, done / total)
+    missing = sorted(np.flatnonzero(~have).tolist(), key=lambda i: len(unique[i]))
     report(STAGE_EMBED, done / total)
     for first in range(0, len(missing), _EMBED_CHUNK):
         _check(cancel)
@@ -482,6 +498,7 @@ def _embed_rows(
             cache.put_many(embedder.model_id, texts, encoded_vectors)
         done += len(chunk)
         report(STAGE_EMBED, done / total)
+    _check(cancel)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     np.divide(vectors, norms, out=vectors, where=norms > 0)
     vectors.flags.writeable = False
@@ -490,7 +507,7 @@ def _embed_rows(
 
 
 def _id_lookup(
-    table: Table, id_columns: list[str], other_text_columns: list[str]
+    table: Table, id_columns: list[str], other_text_columns: list[str], cancel: CancelFn | None = None
 ) -> tuple[dict[str, list[tuple[str, int]]], frozenset[str]]:
     """Normalized identifier (and its space-less form) -> [(column, row)], plus the keys that
     only count when they are the whole query: short letter-only codes that are also ordinary
@@ -499,6 +516,8 @@ def _id_lookup(
     for name in id_columns:
         j = table.column_index(name)
         for r, row in enumerate(table.rows):
+            if r % _CANCEL_EVERY == 0:
+                _check(cancel)
             key = normalize(row[j])
             if key:
                 for variant in dict.fromkeys((key, key.replace(" ", ""))):
@@ -509,7 +528,9 @@ def _id_lookup(
     words: set[str] = set()
     seen: set[str] = set()
     indices = [table.column_index(name) for name in other_text_columns]
-    for row in table.rows:
+    for r, row in enumerate(table.rows):
+        if r % _CANCEL_EVERY == 0:
+            _check(cancel)
         for j in indices:
             cell = row[j]
             if cell not in seen:

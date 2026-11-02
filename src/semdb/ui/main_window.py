@@ -12,7 +12,16 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QObject, QPoint, QRect, QStandardPaths, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFont, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QDesktopServices,
+    QFont,
+    QGuiApplication,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -82,6 +91,47 @@ LICENCES = (
     "RapidFuzz (MIT), python-calamine (MIT) and XlsxWriter (BSD-2). Embedding model: "
     "paraphrase-multilingual-MiniLM-L12-v2 by sentence-transformers (Apache 2.0). Icons: Lucide (ISC)."
 )
+# Share of an index build spent in each engine stage (core/engine.py STAGE_*, named by the text
+# before "…"), in build order, as measured on 2,500- and 45,000-row workbooks.  Embedding
+# dominates a first build; without the language model that stage does not run.
+BUILD_STAGES = (
+    ("Analyzing columns", 1),
+    ("Learning identity aliases", 7),
+    ("Indexing words", 5),
+    ("Understanding rows", 85),
+    ("Finalizing", 2),
+)
+EMBED_STAGE = "Understanding rows"
+
+
+def build_fraction(stage: str, fraction: float, semantic: bool) -> float | None:
+    """Progress of the whole index build when ``stage`` is ``fraction`` done (the engine restarts
+    at 0 in every stage); None for a stage the build does not have."""
+    stages = [(name, share) for name, share in BUILD_STAGES if semantic or name != EMBED_STAGE]
+    name, before = stage.split("…")[0].strip(), 0
+    for known, share in stages:
+        if known == name:
+            return (before + share * min(max(fraction, 0.0), 1.0)) / sum(share for _, share in stages)
+        before += share
+    return None
+
+
+def submitted_span(text: str, submitted: str) -> tuple[int, int] | None:
+    """Where the searched ``submitted`` lines still stand, whole and unedited, in the composer's
+    ``text`` (with the line break joining them to what was typed meanwhile); None when edited."""
+    start = text.find(submitted)
+    while submitted and start >= 0:
+        end = start + len(submitted)
+        if (start == 0 or text[start - 1] == "\n" or submitted[0] == "\n") and (
+            end == len(text) or text[end] == "\n" or submitted[-1] == "\n"
+        ):
+            if text[end:end + 1] == "\n":
+                end += 1
+            elif text[start - 1:start] == "\n":
+                start -= 1
+            return start, end
+        start = text.find(submitted, start + 1)
+    return None
 
 
 def format_seconds(seconds: float) -> str:
@@ -185,12 +235,15 @@ class MainWindow(QMainWindow):
         self._build_waiting = False
         self._build_notify = False
         self._build_started = 0.0
-        self._build_progress = ("", 0.0)
+        self._build_progress = ("", 0.0)  # the engine's stage and that stage's fraction
+        self._build_fraction = 0.0  # of the whole build; never decreases within one build
+        self._build_semantic = False  # the build embeds rows
         self._build_eta = ""
         self._build_error = ""
         self._eta = EtaTracker()
         self._search_task: Task | None = None
         self._search_started = 0.0
+        self._submitted_text: str | None = None  # the composer text being searched
         self._entries: list[HistoryEntry] = []
 
         self.setWindowTitle(APP_NAME)
@@ -671,6 +724,8 @@ class MainWindow(QMainWindow):
         cache = self._embedding_cache() if embedder is not None else None
         self._build_state = "building"
         self._build_progress = ("Analyzing columns…", 0.0)
+        self._build_fraction = 0.0
+        self._build_semantic = embedder is not None
         self._build_eta = ""
         self._build_started = time.monotonic()
         self._eta.reset()
@@ -696,6 +751,9 @@ class MainWindow(QMainWindow):
         if generation != self._build_generation or self._build_state != "building":
             return
         self._build_progress = (stage, fraction)
+        overall = build_fraction(stage, fraction, self._build_semantic)
+        if overall is not None:
+            self._build_fraction = max(self._build_fraction, overall)
         self._build_eta = self._eta.update(stage, fraction)
         self._update_build_widgets()
 
@@ -750,6 +808,7 @@ class MainWindow(QMainWindow):
             return
         store = self.store
         self._search_started = time.perf_counter()
+        self._submitted_text = self.composer.editor.toPlainText() if from_composer else None
         self.composer.set_busy(True, 0.0)
         self._set_status(f"Searching {plural(len(queries), 'query', 'queries')}…")
 
@@ -775,8 +834,8 @@ class MainWindow(QMainWindow):
         elapsed = time.perf_counter() - self._search_started
         keys = {entry_key(e) for e in saved}
         self._entries = [e for e in self._entries if entry_key(e) not in keys] + list(saved)
-        if from_composer:
-            self.composer.clear()
+        if from_composer and self._submitted_text is not None:
+            self._clear_submitted(self._submitted_text)
         self.composer.set_busy(False)
         if self.filter_edit.text():
             self.filter_edit.blockSignals(True)
@@ -793,6 +852,20 @@ class MainWindow(QMainWindow):
             self.view.reveal(entry_key(first), expand=count == 1)
             self.view.setFocus()
         self._set_status(f"Searched {plural(count, 'query', 'queries')} in {format_seconds(elapsed)}")
+
+    def _clear_submitted(self, submitted: str) -> None:
+        """Take the searched lines out of the composer; what was typed during the search stays,
+        and a searched line that was edited keeps everything as the user left it."""
+        editor = self.composer.editor
+        text = editor.toPlainText()
+        span = submitted_span(text, submitted)
+        if span is None:
+            return
+        start, end = (len(text[:i].encode("utf-16-le")) // 2 for i in span)  # Qt counts UTF-16 units
+        cursor = QTextCursor(editor.document())  # an edit, not a reset: the user's cursor and undo stay
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
 
     def _on_search_failed(self, message: str) -> None:
         self._search_task = None
@@ -1125,15 +1198,16 @@ class MainWindow(QMainWindow):
         else:
             reason = ""
         self.composer.set_ready(ready, reason)
-        self.view.can_rerun = ready
-        self.details.can_rerun = ready
+        busy = "A search is running" if self._search_task is not None else ""  # run_search would ignore it
+        self.view.can_rerun = ready and not busy
+        self.details.set_rerun(ready and not busy, reason or busy)
         self._update_model_status()
 
     def _export_running(self) -> bool:
         return any(task.name == "export" for task in self.runner.active())
 
     def _update_build_widgets(self) -> None:
-        stage, fraction = self._build_progress
+        stage, fraction = self._build_progress[0], self._build_fraction
         if self._dataset_loading and self._table is None:
             self.indexing_page.show_waiting("Opening your database…")
         if self._table is None:
@@ -1143,7 +1217,7 @@ class MainWindow(QMainWindow):
             self.dataset_chip.set_state("working", "Preparing…")
             self.indexing_page.show_waiting("Loading the language model…")
         elif state == "building":
-            self.dataset_chip.set_state("working", f"Indexing {round(fraction * 100)}%", fraction)
+            self.dataset_chip.set_state("working", f"Indexing {int(fraction * 100 + 1e-6)}%", fraction)
             self.indexing_page.show_progress(stage or "Preparing…", fraction, self._build_eta)
         elif state == "ready" and self._index is not None:
             self.dataset_chip.set_state("ready", "Ready")
@@ -1212,8 +1286,8 @@ class MainWindow(QMainWindow):
         return None
 
     def closeEvent(self, event) -> None:
+        self.runner.cancel_all()  # first: saving settings can wait for the store behind a dataset save
         self._save_window_state()
-        self.runner.cancel_all()
         self.runner.wait(3000)
         app = QApplication.instance()
         if app is not None:

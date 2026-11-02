@@ -2,10 +2,15 @@
 embedding cache.  Everything lives under paths.data_dir(); nothing leaves the machine.
 
 Both databases use WAL journaling and one connection each, shared across threads and
-serialized by a lock.  A file that SQLite reports as corrupt (or that fails the integrity
-check at startup) is renamed ``<name>.corrupt-<timestamp>`` and recreated; an app database
-written by a newer, incompatible schema is moved aside the same way (``.incompatible-``),
-never modified.  All (de)serialization is explicit JSON; nothing is pickled.
+serialized by a lock.  The UI thread uses the app database while workers store results, so
+its lock is held for SQL only: values are serialized before it is taken, bulk reads use a
+private connection (WAL readers never wait for the writer), the WAL is checkpointed on a
+private connection after the lock is released instead of inside a commit, and a setting
+written while the lock is busy is queued rather than waited for.
+A file that SQLite reports as corrupt (or that fails the integrity check at startup) is renamed
+``<name>.corrupt-<timestamp>`` and recreated; an app database written by a newer, incompatible
+schema is moved aside the same way (``.incompatible-``), never modified.  All
+(de)serialization is explicit JSON; nothing is pickled.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -38,6 +43,7 @@ CACHE_SCHEMA_VERSION = 1
 
 _CHUNK = 500  # keys per "IN (...)" list
 _CORRUPTION_CODES = (11, 26)  # SQLITE_CORRUPT, SQLITE_NOTADB
+_CHECKPOINT_BYTES = 4_000_000  # bulk writes between two WAL checkpoints (SQLite's default: 1,000 pages)
 
 _APP_SCHEMA = {
     "settings": "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -62,6 +68,7 @@ _APP_COLUMNS = {
     "history": {"id", "query", "query_key", "created_at", "payload_json"},
 }
 _CACHE_SCHEMA = "CREATE TABLE IF NOT EXISTS vectors (key BLOB PRIMARY KEY, vec BLOB NOT NULL, used INTEGER NOT NULL)"
+_SETTING_UPSERT = "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value"
 
 
 class SqliteEmbeddingCache:
@@ -72,6 +79,7 @@ class SqliteEmbeddingCache:
         self.max_entries = max_entries
         self._lock = threading.Lock()
         self._tick = 0
+        self._size_bound: int | None = None  # >= the number of stored vectors, once counted
         self._conn = _open_database(self.path, _prepare_cache)
 
     def get_many(self, model_id: str, texts: list[str]) -> dict[int, np.ndarray]:
@@ -114,13 +122,7 @@ class SqliteEmbeddingCache:
                         "ON CONFLICT (key) DO UPDATE SET vec = excluded.vec, used = excluded.used",
                         rows,
                     )
-                    excess = self._conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0] - self.max_entries
-                    if excess > 0:  # least recently used first
-                        self._conn.execute(
-                            "DELETE FROM vectors WHERE rowid IN "
-                            "(SELECT rowid FROM vectors ORDER BY used, rowid LIMIT ?)",
-                            (excess,),
-                        )
+                    self._prune(len(rows))
             except sqlite3.DatabaseError as exc:
                 self._recover(exc)
 
@@ -137,10 +139,27 @@ class SqliteEmbeddingCache:
         self._tick = max(self._tick + 1, time.time_ns() // 1_000_000)
         return self._tick
 
+    def _prune(self, added: int) -> None:
+        """Delete the least recently used vectors beyond max_entries.  Counting scans the table,
+        so it only happens when the bound (stored + every vector put since) may exceed the limit."""
+        if self._size_bound is not None:
+            self._size_bound += added
+            if self._size_bound <= self.max_entries:
+                return
+        count = self._conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+        excess = count - self.max_entries
+        if excess > 0:  # least recently used first
+            self._conn.execute(
+                "DELETE FROM vectors WHERE rowid IN (SELECT rowid FROM vectors ORDER BY used, rowid LIMIT ?)",
+                (excess,),
+            )
+        self._size_bound = count - max(excess, 0)
+
     def _recover(self, exc: sqlite3.DatabaseError) -> None:
         """A cache failure is never fatal: log it, and start a fresh file if this one is corrupt
         (falling back to an in-memory cache for the session when even that fails)."""
         log.warning("Embedding cache error (%s); continuing without it", exc)
+        self._size_bound = None
         if not _is_corruption(exc):
             return
         self._conn.close()
@@ -159,9 +178,15 @@ class Store:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._conn = _open_database(self.data_dir / APP_DB_NAME, _prepare_app)
+        self._path = self.data_dir / APP_DB_NAME
+        self._lock = threading.Lock()  # the shared connection; never nested
+        self._queue_lock = threading.Lock()
+        self._queued: dict[str, str] = {}  # setting key -> JSON waiting for the connection
+        self._unchecked_bytes = 0  # written by bulk writes since the last checkpoint
+        self._closed = False
+        self._conn = _open_database(self._path, _prepare_app)
         try:
+            self._conn.execute("PRAGMA wal_autocheckpoint = 0")  # see _checkpoint
             self._cache = SqliteEmbeddingCache(self.data_dir / CACHE_DB_NAME)
         except BaseException:
             self._conn.close()
@@ -169,6 +194,11 @@ class Store:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
+            try:
+                self._write_queued()
+            except sqlite3.Error as exc:
+                log.warning("Settings could not be saved (%s)", exc)
             self._conn.close()
         self._cache.close()
 
@@ -180,27 +210,39 @@ class Store:
 
     # settings ---------------------------------------------------------------------------
     def get_setting(self, key: str, default: Any = None) -> Any:
-        with self._lock:
-            row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            return default
+        with self._queue_lock:
+            payload = self._queued.get(key)
+        if payload is None:
+            with self._connection() as conn:
+                row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                return default
+            payload = row[0]
         try:
-            return json.loads(row[0], object_hook=_decode_tagged)
+            return json.loads(payload, object_hook=_decode_tagged)
         except ValueError:
             log.warning("Ignoring unreadable setting %r", key)
             return default
 
     def set_setting(self, key: str, value: Any) -> None:
-        """Store any JSON-compatible value (tuples come back as lists); bytes are supported too."""
+        """Store any JSON-compatible value (tuples come back as lists); bytes are supported too.
+
+        Never waits for another thread's transaction (the UI thread saves settings while
+        workers write): if the connection is busy, the value is queued, get_setting returns
+        it at once, and the thread holding the connection writes it when releasing it.
+        """
         payload = json.dumps(value, ensure_ascii=False, default=_encode_extra)
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                (key, payload),
-            )
+        with self._queue_lock:
+            self._queued[key] = payload
+        if self._lock.acquire(blocking=False):
+            try:
+                self._write_queued()
+            finally:
+                self._lock.release()
 
     # dataset ----------------------------------------------------------------------------
     def save_dataset(self, table: Table, roles: Roles) -> None:
+        """Replace the stored dataset in one transaction (everything is encoded before it)."""
         if any(len(row) != len(table.columns) for row in table.rows) or len(table.source_rows) != len(table.rows):
             raise ValueError("table rows must match its columns and source_rows")
         encode = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
@@ -213,24 +255,27 @@ class Store:
             table.fingerprint(),
             _utc_now(),
         )
-        with self._lock, _transaction(self._conn):
-            self._conn.execute("DELETE FROM dataset_rows")
-            self._conn.execute("DELETE FROM dataset")
-            self._conn.execute(
+        with self._connection() as conn, _transaction(conn):
+            conn.execute("DELETE FROM dataset_rows")
+            conn.execute("DELETE FROM dataset")
+            conn.execute(
                 "INSERT INTO dataset (id, source_name, sheet_name, columns_json, roles_json, fingerprint, saved_at) "
                 "VALUES (1, ?, ?, ?, ?, ?, ?)",
                 head,
             )
-            self._conn.executemany("INSERT INTO dataset_rows (idx, source_row, cells_json) VALUES (?, ?, ?)", records)
+            conn.executemany("INSERT INTO dataset_rows (idx, source_row, cells_json) VALUES (?, ?, ?)", records)
+            due = self._wrote(sum(len(record[2]) for record in records))
+        if due:
+            self._checkpoint()
 
     def load_dataset(self) -> tuple[Table, Roles] | None:
-        with self._lock:
-            head = self._conn.execute(
+        with self._snapshot() as conn:
+            head = conn.execute(
                 "SELECT source_name, sheet_name, columns_json, roles_json FROM dataset WHERE id = 1"
             ).fetchone()
             if head is None:
                 return None
-            records = self._conn.execute("SELECT source_row, cells_json FROM dataset_rows ORDER BY idx").fetchall()
+            records = conn.execute("SELECT source_row, cells_json FROM dataset_rows ORDER BY idx").fetchall()
         source_name, sheet_name, columns_json, roles_json = head
         try:
             columns = [str(name) for name in json.loads(columns_json)]
@@ -253,20 +298,20 @@ class Store:
 
     def save_roles(self, roles: Roles) -> None:
         """Replace the stored roles of the current dataset (no-op when there is none)."""
-        with self._lock, _transaction(self._conn):
-            row = self._conn.execute("SELECT columns_json FROM dataset WHERE id = 1").fetchone()
+        with self._connection() as conn, _transaction(conn):
+            row = conn.execute("SELECT columns_json FROM dataset WHERE id = 1").fetchone()
             if row is not None:
                 payload = json.dumps(_roles_to_dict(roles, json.loads(row[0])), ensure_ascii=False)
-                self._conn.execute("UPDATE dataset SET roles_json = ? WHERE id = 1", (payload,))
+                conn.execute("UPDATE dataset SET roles_json = ? WHERE id = 1", (payload,))
 
     def has_dataset(self) -> bool:
-        with self._lock:
-            return self._conn.execute("SELECT 1 FROM dataset WHERE id = 1").fetchone() is not None
+        with self._connection() as conn:
+            return conn.execute("SELECT 1 FROM dataset WHERE id = 1").fetchone() is not None
 
     def clear_dataset(self) -> None:
-        with self._lock, _transaction(self._conn):
-            self._conn.execute("DELETE FROM dataset_rows")
-            self._conn.execute("DELETE FROM dataset")
+        with self._connection() as conn, _transaction(conn):
+            conn.execute("DELETE FROM dataset_rows")
+            conn.execute("DELETE FROM dataset")
 
     # history ----------------------------------------------------------------------------
     def add_entries(self, entries: list[HistoryEntry]) -> list[HistoryEntry]:
@@ -280,23 +325,27 @@ class Store:
             key = query_key(entry.query)
             latest.pop(key, None)
             latest[key] = entry
+        # Encode before taking the connection: only SQL runs while other threads wait for it.
         encode = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
         prepared = [(key, history_entry_to_dict(entry)) for key, entry in latest.items()]
-        stored: list[HistoryEntry] = []
-        with self._lock, _transaction(self._conn):
-            for key, data in prepared:
-                self._conn.execute("DELETE FROM history WHERE query_key = ?", (key,))
-                cursor = self._conn.execute(
-                    "INSERT INTO history (query, query_key, created_at, payload_json) VALUES (?, ?, ?, ?)",
-                    (data["query"], key, data["created_at"], encode(data)),
+        records = [(data["query"], key, data["created_at"], encode(data)) for key, data in prepared]
+        ids: list[int] = []
+        with self._connection() as conn, _transaction(conn):
+            for record in records:
+                conn.execute("DELETE FROM history WHERE query_key = ?", (record[1],))
+                cursor = conn.execute(
+                    "INSERT INTO history (query, query_key, created_at, payload_json) VALUES (?, ?, ?, ?)", record
                 )
-                stored.append(history_entry_from_dict({**data, "id": cursor.lastrowid}))
-        return stored
+                ids.append(cursor.lastrowid)
+            due = self._wrote(sum(len(record[3]) for record in records))
+        if due:
+            self._checkpoint()
+        return [history_entry_from_dict({**data, "id": entry_id}) for (_, data), entry_id in zip(prepared, ids)]
 
     def load_entries(self) -> list[HistoryEntry]:
         """Every stored entry, oldest (first stored) to newest."""
-        with self._lock:
-            records = self._conn.execute("SELECT id, query, created_at, payload_json FROM history ORDER BY id").fetchall()
+        with self._snapshot() as conn:
+            records = conn.execute("SELECT id, query, created_at, payload_json FROM history ORDER BY id").fetchall()
         entries: list[HistoryEntry] = []
         for entry_id, query, created_at, payload in records:
             try:
@@ -307,19 +356,85 @@ class Store:
         return entries
 
     def delete_entries(self, ids: list[int]) -> None:
-        with self._lock, _transaction(self._conn):
+        with self._connection() as conn, _transaction(conn):
             for chunk in _chunks([int(entry_id) for entry_id in ids]):
                 marks = ",".join("?" * len(chunk))
-                self._conn.execute(f"DELETE FROM history WHERE id IN ({marks})", chunk)
+                conn.execute(f"DELETE FROM history WHERE id IN ({marks})", chunk)
 
     def clear_entries(self) -> None:
-        with self._lock:
-            self._conn.execute("DELETE FROM history")
+        with self._connection() as conn:
+            conn.execute("DELETE FROM history")
 
     # embeddings -------------------------------------------------------------------------
     @property
     def embedding_cache(self) -> SqliteEmbeddingCache:
         return self._cache
+
+    # connections ------------------------------------------------------------------------
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """The shared connection, exclusively; settings queued meanwhile are written on release."""
+        try:
+            with self._lock:
+                yield self._conn
+        finally:
+            while self._queued and self._lock.acquire(blocking=False):
+                try:
+                    self._write_queued()
+                except sqlite3.Error as exc:  # they stay queued for the next attempt
+                    log.warning("Settings could not be saved (%s)", exc)
+                    break
+                finally:
+                    self._lock.release()
+
+    def _write_queued(self) -> None:
+        """Write the settings queued by set_setting (call with the lock held)."""
+        with self._queue_lock:
+            queued = list(self._queued.items())
+        if not queued:
+            return
+        self._conn.executemany(_SETTING_UPSERT, queued)
+        with self._queue_lock:
+            for key, payload in queued:
+                if self._queued.get(key) is payload:  # not replaced meanwhile
+                    del self._queued[key]
+
+    def _wrote(self, size: int) -> bool:
+        """Count ``size`` bytes a bulk write added to the WAL (call with the lock held); True
+        when a checkpoint is due."""
+        self._unchecked_bytes += size
+        if self._unchecked_bytes < _CHECKPOINT_BYTES:
+            return False
+        self._unchecked_bytes = 0
+        return True
+
+    def _checkpoint(self) -> None:
+        """Copy the WAL into the database on a private connection, without holding the lock.
+
+        Auto-checkpoint is off for the shared connection: SQLite would run it inside a commit,
+        keeping every other thread waiting for the lock meanwhile, and a passive checkpoint
+        blocks no writer.  Bulk writes (workers) call this; the little WAL that small writes
+        add is copied by the next one, or when the store closes.
+        """
+        try:
+            with closing(self._private_connection()) as conn:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error as exc:
+            log.warning("Checkpoint of %s failed (%s)", self._path.name, exc)
+
+    @contextmanager
+    def _snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A private connection reading one consistent snapshot of the committed data, for bulk
+        reads: they never hold the shared connection (WAL readers do not wait for the writer)."""
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        with closing(self._private_connection()) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            yield conn
+
+    def _private_connection(self) -> sqlite3.Connection:
+        return sqlite3.connect(str(self._path), timeout=10.0, isolation_level=None)
 
 
 # ------------------------------------------------------------------------------------------

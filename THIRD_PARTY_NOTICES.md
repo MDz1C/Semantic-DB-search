@@ -1,12 +1,12 @@
 # Third-party notices
 
-Semantic DB Search is © 2026 Manuel Dzimah and released under the MIT License (see `LICENSE`).
+Fundscope is © 2026 Manuel Dzimah and released under the MIT License (see `LICENSE`).
 The Windows app is distributed together with the open-source components listed below.
 
 Licence identifiers and texts were taken from each component's installed package metadata (the
 `.dist-info` folders and licence files of the versions pinned in `requirements.txt`), from the
 model card at the pinned model revision, and from the Lucide repository. In the installed app the
-complete licence texts are in the `_internal\licenses` folder next to `SemanticDBSearch.exe`
+complete licence texts are in the `_internal\licenses` folder next to `Fundscope.exe`
 (collected by `packaging/semdb.spec`); texts that the packages do not ship themselves are kept in
 `packaging/licenses/`.
 
@@ -285,7 +285,7 @@ in `licenses/Python/LICENSE.txt`.
 
 ## PyInstaller bootloader (GPL-2.0-or-later with Bootloader Exception)
 
-`SemanticDBSearch.exe` starts with the PyInstaller bootloader, which may be distributed with
+`Fundscope.exe` starts with the PyInstaller bootloader, which may be distributed with
 programs under any licence thanks to this exception (full terms in
 `licenses/PyInstaller/COPYING.txt`):
 

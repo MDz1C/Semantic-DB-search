@@ -1,14 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>Fundscope</title>
   <defs>
-    <linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="16" y2="16">
-      <stop offset="0" stop-color="#4F46E5"/>
-      <stop offset="1" stop-color="#7C3AED"/>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1E3A8A"/>
+      <stop offset="1" stop-color="#0F172A"/>
     </linearGradient>
   </defs>
-  <rect x="0" y="0" width="16" height="16" rx="3.5" fill="url(#tile)"/>
-  <path fill="#FFFFFF" fill-rule="evenodd" d="M3.5 2H10.5C11.328 2 12 2.672 12 3.5V10.5C12 11.328 11.328 12 10.5 12H3.5C2.672 12 2 11.328 2 10.5V3.5C2 2.672 2.672 2 3.5 2ZM3 4H5V7H3V4ZM6 4H11V7H6V4ZM3 8H5V11H3.5C3.224 11 3 10.776 3 10.5V8ZM6 8H11V10.5C11 10.776 10.776 11 10.5 11H6V8Z"/>
-  <circle cx="10.75" cy="10.75" r="4.5" fill="url(#tile)"/>
-  <line x1="12.695" y1="12.695" x2="13.6" y2="13.6" stroke-linecap="round" stroke="url(#tile)" stroke-width="4"/>
-  <circle cx="10.75" cy="10.75" r="2.75" fill="#FFFFFF" fill-opacity="0.18" stroke="#FFFFFF" stroke-width="1.5"/>
-  <line x1="12.695" y1="12.695" x2="13.6" y2="13.6" stroke-linecap="round" stroke="#FFFFFF" stroke-width="2"/>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <circle cx="112.44" cy="112.19" r="49.5" fill="#FFFFFF" fill-opacity="0.14"/>
+  <path d="M 170.66 97.67 A 60 60 0 1 1 139.44 58.61" fill="none" stroke="#FFFFFF" stroke-width="21" stroke-linecap="round"/>
+  <path d="M 160.88 160.63 L 199.06 198.81" stroke="#FFFFFF" stroke-width="30" stroke-linecap="round"/>
+  <path d="M 82.44 134.19 L 101.44 115.19 L 116.44 126.19 L 146.44 88.19 L 169.7 63.87" fill="none" stroke="#34D399" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 190.44 42.19 L 183.43 77 L 155.97 50.74 Z" fill="#34D399" stroke="#34D399" stroke-width="6" stroke-linejoin="round"/>
 </svg>

@@ -65,7 +65,7 @@ def export_history(path: str | Path, entries: list[HistoryEntry], k: int) -> Non
 def _workbook_bytes(entries: list[HistoryEntry], k: int) -> bytes:
     buffer = io.BytesIO()
     with xlsxwriter.Workbook(buffer, {**WORKBOOK_OPTIONS, "in_memory": True}) as workbook:
-        workbook.set_properties({"title": "Search results", "comments": "Exported by Semantic DB Search"})
+        workbook.set_properties({"title": "Search results", "comments": "Exported by Fundscope"})
         header = workbook.add_format(
             {"bold": True, "bg_color": "#EEF2FF", "font_color": "#111827", "bottom": 1, "bottom_color": "#CDD2DC"}
         )
