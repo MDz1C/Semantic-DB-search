@@ -2,10 +2,10 @@
 
 <img src="assets/icon.png" alt="Fundscope logo: a magnifying glass whose rising stock line breaks out through the lens" width="96" align="right">
 
-**Find any fund in your database — even when the names don't match.**
+**Find any fund in your database, even when the names don't match.**
 
 Fundscope is an installable Windows desktop app that finds the rows of your spreadsheet
-database that best match each line you paste — intelligently. It understands meaning (abbreviations,
+database that best match each line you paste. It understands meaning (abbreviations,
 typos, Spanish ↔ English), stays exact where it matters (`S&P 500` is not `S&P 400`, an ISIN
 is an ISIN), and never mixes up the identities you mark as **deciding**: a query for an
 *iShares* fund will not return a *Vanguard* fund first just because more of the other words
@@ -53,9 +53,9 @@ Requirements: Windows 10 or 11, 64-bit. The installer is 114 MB; the installed a
 
 1. **Import your database.** Click **Import** (or drop a file on the window). In the setup dialog,
    check the sheet and header row, then choose how each column is used:
-   - **Deciding** — identity that must match (brokerage, issuer, family, ISIN, ticker).
-   - **Search** — text that describes the item (fund name, category).
-   - **Display only** — shown in results but not used for matching (TER, AUM, dates…).
+   - **Deciding**: identity that must match (brokerage, issuer, family, ISIN, ticker).
+   - **Search**: text that describes the item (fund name, category).
+   - **Display only**: shown in results but not used for matching (TER, AUM, dates…).
 2. **Wait for the first indexing** (about 40 seconds for 45,000 rows; afterwards the app starts in
    seconds because it remembers what it has already processed).
 3. **Paste your queries** in the box at the bottom, one per line, and press **Search**
@@ -72,7 +72,7 @@ Every query is scored against every row in three complementary ways:
 
 | Signal | What it catches | How |
 |--------|-----------------|-----|
-| **Identity** (deciding columns) | "this is an iShares fund, so look at BlackRock rows" | Detects deciding values in the query — exact words, learned aliases, abbreviations, typos — and pushes rows from a *different* family far down |
+| **Identity** (deciding columns) | "this is an iShares fund, so look at BlackRock rows" | Detects deciding values in the query (exact words, learned aliases, abbreviations, typos) and pushes rows from a *different* family far down |
 | **Meaning** | abbreviations, synonyms, word order, Spanish ↔ English | Multilingual sentence embeddings (`paraphrase-multilingual-MiniLM-L12-v2`, run offline with ONNX Runtime) |
 | **Exact words** | `500` vs `400`, `Acc` vs `Dist`, codes, typos, `Hdg` = `Hedged` | Character n-gram + word TF-IDF index, plus common fund-name abbreviations (English and Spanish) |
 
@@ -87,7 +87,7 @@ score = text similarity (meaning + exact words) × identity agreement
 so an otherwise similar fund from the wrong brokerage drops to the bottom, while rows without
 any identity conflict compete on their description. An ISIN or ticker in the query is an exact hit.
 
-Measured on a synthetic 45,000-row fund universe with 600 perturbed queries — abbreviated
+Measured on a synthetic 45,000-row fund universe with 600 perturbed queries: abbreviated
 brands, the company instead of the brand, typos, reordered or missing words, reworded share
 classes, Spanish/English paraphrases, bare ISINs (`python tools/evaluate.py`; weights were tuned on
 a *different* random universe, so this is a held-out test):
@@ -146,5 +146,5 @@ Run the tests with `.venv\Scripts\python -m pytest`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Bundled third-party components are listed in
+MIT. See [LICENSE](LICENSE). Bundled third-party components are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
