@@ -7,7 +7,7 @@
 Fundscope is an installable Windows desktop app that finds the rows of your spreadsheet
 database that best match each line you paste. It understands meaning (abbreviations,
 typos, Spanish ↔ English), stays exact where it matters (`S&P 500` is not `S&P 400`, an ISIN
-is an ISIN), and never mixes up the identities you mark as **deciding**: a query for an
+is an ISIN) and never mixes up the identities you mark as **deciding**: a query for an
 *iShares* fund will not return a *Vanguard* fund first just because more of the other words
 happen to overlap.
 
